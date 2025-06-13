@@ -1,0 +1,20 @@
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: bkarthik-metrics-simple
+  namespace: ns-team-bkarthik
+spec:
+  metrics:
+  - '{__name__=~"node_cpu_seconds_total|node_memory_MemAvailable_bytes",job="node-exporter",container="kube-rbac-proxy",namespace="monitoring"}'
+  remoteWrite:
+    enabled: true
+    extraLabels:
+      managed_by: multi-tenant-proxy
+      tenant: team-bkarthik
+    interval: 30s
+    prometheus:
+      serviceName: prometheus
+      servicePort: 9090
+    target:
+      type: prometheus
+  source: ns-team-bkarthik 

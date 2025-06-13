@@ -1,0 +1,77 @@
+---
+# Example 1: Basic tenant with specific metrics
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: tenant-metrics-access
+  namespace: myusernamespace
+spec:
+  metrics:
+    - foo
+    - bar{label="x"}
+    - '{__name__="foo",label="x"}'
+  source: myusernamespace
+
+---
+# Example 2: Development team with broader access
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: dev-team-metrics
+  namespace: development
+spec:
+  metrics:
+    - "http_.*"  # All HTTP metrics (regex)
+    - "cpu_usage"
+    - "memory_usage"
+    - '{job="my-app"}'  # All metrics from specific job
+  source: development
+  labelSelectors:
+    environment: "dev"
+
+---
+# Example 3: Production monitoring team with extensive access
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: prod-monitoring-access
+  namespace: production
+spec:
+  metrics:
+    - ".*"  # All metrics (use with caution)
+  source: production
+  labelSelectors:
+    environment: "prod"
+
+---
+# Example 4: Application-specific metrics access
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: webapp-metrics
+  namespace: webapp-team
+spec:
+  metrics:
+    - "http_requests_total"
+    - "http_request_duration_seconds"
+    - "http_requests_in_flight"
+    - '{__name__=~"webapp_.*"}'  # All webapp-prefixed metrics
+    - "up{job=\"webapp\"}"
+  source: webapp-team
+  labelSelectors:
+    app: "webapp"
+
+---
+# Example 5: Infrastructure team with system metrics
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: infra-system-metrics
+  namespace: infrastructure
+spec:
+  metrics:
+    - "node_.*"  # All node exporter metrics
+    - "kube_.*"  # All kube-state-metrics
+    - "container_.*"  # All container metrics
+    - '{__name__=~"prometheus_.*"}'  # Prometheus internal metrics
+  source: infrastructure 

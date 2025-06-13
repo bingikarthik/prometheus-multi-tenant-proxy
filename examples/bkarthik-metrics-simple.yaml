@@ -1,0 +1,26 @@
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: bkarthik-metrics-simple
+  namespace: ns-team-bkarthik
+spec:
+  # Source should match the tenant namespace or identifier for metrics
+  source: ns-team-bkarthik
+  
+  # Metrics patterns
+  metrics:
+    - 'node_cpu_seconds_total'
+    - 'node_memory_MemAvailable_bytes'
+
+  # Remote write configuration
+  remoteWrite:
+    enabled: true
+    interval: "30s"
+    target:
+      type: "prometheus"
+    prometheus:
+      serviceName: "prometheus"
+      servicePort: 9090
+    extraLabels:
+      managed_by: "multi-tenant-proxy"
+      tenant: "team-bkarthik" 
