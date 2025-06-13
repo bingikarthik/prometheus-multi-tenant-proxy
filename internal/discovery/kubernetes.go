@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -276,19 +277,9 @@ func (kd *kubernetesDiscovery) podToTargets(pod *corev1.Pod) []Target {
 	
 	// Create target URL
 	var targetURL string
-	
-	// Check if this is a StatefulSet pod (has a stable network identity)
-	if pod.Spec.Subdomain != "" && pod.Spec.Hostname != "" {
-		// Use the StatefulSet DNS name
-		targetURL = fmt.Sprintf("http://%s.%s.%s.svc.cluster.local:%d",
-			pod.Spec.Hostname,
-			pod.Spec.Subdomain,
-			pod.Namespace,
-			port)
-	} else {
-		// Fall back to pod IP
-		targetURL = fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
-	}
+
+	// Try direct IP access first - this is most reliable
+	targetURL = fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
 	
 	target := Target{
 		URL:      targetURL,
