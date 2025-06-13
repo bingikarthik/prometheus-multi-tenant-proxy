@@ -199,15 +199,59 @@ func (c *Controller) createRemoteWriteJobLocked(ctx context.Context, metricAcces
 	// Validate target type
 	targetType := metricAccess.Spec.RemoteWrite.Target.Type
 	if targetType != "prometheus" && targetType != "pushgateway" && targetType != "remote_write" {
+		logrus.WithFields(logrus.Fields{
+			"namespace":   metricAccess.Namespace,
+			"name":        metricAccess.Name,
+			"target_type": targetType,
+		}).Error("DIAGNOSTIC: Unsupported remote write target type")
 		return fmt.Errorf("unsupported remote write target type: %s", targetType)
 	}
 	
 	// Discover targets for this tenant
-	targets := c.serviceDiscovery.GetTargets()
+	allTargets := c.serviceDiscovery.GetTargets()
+	
+	// Filter for healthy targets only
+	var healthyTargets []discovery.Target
+	for _, target := range allTargets {
+		if target.Healthy {
+			healthyTargets = append(healthyTargets, target)
+		}
+	}
+	
+	// Log target information
+	logrus.WithFields(logrus.Fields{
+		"namespace":        metricAccess.Namespace,
+		"name":             metricAccess.Name,
+		"all_targets":      len(allTargets),
+		"healthy_targets":  len(healthyTargets),
+		"metric_patterns":  metricAccess.Spec.Metrics,
+	}).Error("DIAGNOSTIC: Creating remote write job with targets")
+	
+	// Log details of each target for debugging
+	for i, target := range healthyTargets {
+		if i < 5 { // Log details of first 5 targets only to avoid log spam
+			logrus.WithFields(logrus.Fields{
+				"target_index": i,
+				"target_url":   target.URL,
+				"labels":       fmt.Sprintf("%v", target.Labels),
+				"namespace":    metricAccess.Namespace,
+				"name":         metricAccess.Name,
+			}).Error("DIAGNOSTIC: Target for remote write job")
+		}
+	}
+	
+	// Check if we have any healthy targets
+	if len(healthyTargets) == 0 {
+		logrus.WithFields(logrus.Fields{
+			"namespace": metricAccess.Namespace,
+			"name":      metricAccess.Name,
+		}).Error("DIAGNOSTIC: No healthy targets found for remote write job")
+		// Create job anyway, but with empty targets list
+	}
 	
 	job := &RemoteWriteJob{
 		MetricAccess: metricAccess.DeepCopy(),
-		Targets:      targets,
+		Targets:      healthyTargets,
 		StopCh:       make(chan struct{}),
 	}
 	
@@ -216,7 +260,13 @@ func (c *Controller) createRemoteWriteJobLocked(ctx context.Context, metricAcces
 	// Start the remote write job
 	go c.runRemoteWriteJob(job)
 	
-	logrus.Infof("Created remote write job for %s", key)
+	logrus.WithFields(logrus.Fields{
+		"namespace":       metricAccess.Namespace,
+		"name":            metricAccess.Name,
+		"targets_count":   len(healthyTargets),
+		"metrics_count":   len(metricAccess.Spec.Metrics),
+	}).Info("Created remote write job")
+	
 	return nil
 }
 
@@ -318,23 +368,40 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 
 // collectFromTarget collects metrics from a single target
 func (c *Controller) collectFromTarget(job *RemoteWriteJob, target discovery.Target) ([]Metric, error) {
-	// Use the highest log level to make sure this appears in the logs
+	// ALWAYS log target details at ERROR level for maximum visibility
 	logrus.WithFields(logrus.Fields{
-		"target": target.URL,
-		"job":    fmt.Sprintf("%s/%s", job.MetricAccess.Namespace, job.MetricAccess.Name),
-	}).Error("DIAGNOSTIC: Starting metric collection from target") 
+		"target_url": target.URL,
+		"job":        fmt.Sprintf("%s/%s", job.MetricAccess.Namespace, job.MetricAccess.Name),
+		"healthy":    target.Healthy,
+		"labels":     fmt.Sprintf("%v", target.Labels),
+	}).Error("DIAGNOSTIC: Starting metric collection from target")
+
+	// Skip unhealthy targets
+	if !target.Healthy {
+		logrus.WithFields(logrus.Fields{
+			"target_url": target.URL,
+		}).Error("DIAGNOSTIC: Skipping unhealthy target")
+		return nil, fmt.Errorf("target is unhealthy")
+	}
 
 	var metrics []Metric
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
 
+	// Log all metric patterns we're going to query
+	logrus.WithFields(logrus.Fields{
+		"target_url":     target.URL,
+		"metric_count":   len(job.MetricAccess.Spec.Metrics),
+		"metric_patterns": job.MetricAccess.Spec.Metrics,
+	}).Error("DIAGNOSTIC: Metric patterns to query")
+
 	// Query each metric pattern
 	for _, pattern := range job.MetricAccess.Spec.Metrics {
 		logrus.WithFields(logrus.Fields{
-			"pattern": pattern,
-			"target":  target.URL,
-		}).Error("DIAGNOSTIC: Processing metric pattern") 
+			"pattern":    pattern,
+			"target_url": target.URL,
+		}).Error("DIAGNOSTIC: Processing metric pattern")
 
 		// Handle label selector patterns
 		var queryPattern string
@@ -360,16 +427,18 @@ func (c *Controller) collectFromTarget(job *RemoteWriteJob, target discovery.Tar
 		// Try the regular query first
 		logrus.WithFields(logrus.Fields{
 			"query_pattern": queryPattern,
-			"target":        target.URL,
+			"target_url":    target.URL,
 		}).Error("DIAGNOSTIC: Querying with standard pattern")
 		
 		metricResults, err := c.queryPromQL(client, target.URL, queryPattern)
 		if err != nil {
 			logrus.WithFields(logrus.Fields{
-				"error":   err,
-				"pattern": queryPattern,
-				"target":  target.URL,
-			}).Error("Failed to query metrics")
+				"error":        err,
+				"pattern":      queryPattern,
+				"target_url":   target.URL,
+				"error_type":   fmt.Sprintf("%T", err),
+				"error_details": err.Error(),
+			}).Error("DIAGNOSTIC: Failed to query metrics")
 			continue
 		}
 
@@ -377,11 +446,17 @@ func (c *Controller) collectFromTarget(job *RemoteWriteJob, target discovery.Tar
 		if len(metricResults) > 0 {
 			metrics = append(metrics, metricResults...)
 			logrus.WithFields(logrus.Fields{
-				"count":   len(metricResults),
-				"pattern": queryPattern,
-				"target":  target.URL,
+				"count":        len(metricResults),
+				"pattern":      queryPattern,
+				"target_url":   target.URL,
+				"first_metric": metricResults[0].Name,
 			}).Error("DIAGNOSTIC: Found metrics with standard pattern")
 			continue
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"pattern":    queryPattern,
+				"target_url": target.URL,
+			}).Error("DIAGNOSTIC: No metrics found with standard pattern")
 		}
 
 		// If no metrics found and this is a simple metric name, try different strategies
@@ -391,24 +466,31 @@ func (c *Controller) collectFromTarget(job *RemoteWriteJob, target discovery.Tar
 				nodeQueryPattern := fmt.Sprintf("{__name__=\"%s\",job=\"node-exporter\"}", pattern)
 				logrus.WithFields(logrus.Fields{
 					"query_pattern": nodeQueryPattern,
-					"target":        target.URL,
+					"target_url":    target.URL,
 				}).Error("DIAGNOSTIC: Trying node-exporter specific pattern")
 				
 				nodeMetrics, err := c.queryPromQL(client, target.URL, nodeQueryPattern)
 				if err != nil {
 					logrus.WithFields(logrus.Fields{
-						"error":   err,
-						"pattern": nodeQueryPattern,
-						"target":  target.URL,
-					}).Error("Failed to query with node-exporter pattern")
+						"error":        err,
+						"pattern":      nodeQueryPattern,
+						"target_url":   target.URL,
+						"error_details": err.Error(),
+					}).Error("DIAGNOSTIC: Failed to query with node-exporter pattern")
 				} else if len(nodeMetrics) > 0 {
 					metrics = append(metrics, nodeMetrics...)
 					logrus.WithFields(logrus.Fields{
-						"count":   len(nodeMetrics),
-						"pattern": nodeQueryPattern,
-						"target":  target.URL,
+						"count":        len(nodeMetrics),
+						"pattern":      nodeQueryPattern,
+						"target_url":   target.URL,
+						"first_metric": nodeMetrics[0].Name,
 					}).Error("DIAGNOSTIC: Found metrics with node-exporter pattern")
 					continue
+				} else {
+					logrus.WithFields(logrus.Fields{
+						"pattern":    nodeQueryPattern,
+						"target_url": target.URL,
+					}).Error("DIAGNOSTIC: No metrics found with node-exporter pattern")
 				}
 			}
 			
@@ -416,36 +498,38 @@ func (c *Controller) collectFromTarget(job *RemoteWriteJob, target discovery.Tar
 			flexibleQueryPattern := fmt.Sprintf("{__name__=\"%s\"}", pattern)
 			logrus.WithFields(logrus.Fields{
 				"query_pattern": flexibleQueryPattern,
-				"target":        target.URL,
+				"target_url":    target.URL,
 			}).Error("DIAGNOSTIC: Trying generic pattern without selectors")
 			
 			flexibleMetrics, err := c.queryPromQL(client, target.URL, flexibleQueryPattern)
 			if err != nil {
 				logrus.WithFields(logrus.Fields{
-					"error":   err,
-					"pattern": flexibleQueryPattern,
-					"target":  target.URL,
-				}).Error("Failed to query with generic pattern")
+					"error":        err,
+					"pattern":      flexibleQueryPattern,
+					"target_url":   target.URL,
+					"error_details": err.Error(),
+				}).Error("DIAGNOSTIC: Failed to query with generic pattern")
 			} else if len(flexibleMetrics) > 0 {
 				metrics = append(metrics, flexibleMetrics...)
 				logrus.WithFields(logrus.Fields{
-					"count":   len(flexibleMetrics),
-					"pattern": flexibleQueryPattern,
-					"target":  target.URL,
+					"count":        len(flexibleMetrics),
+					"pattern":      flexibleQueryPattern,
+					"target_url":   target.URL,
+					"first_metric": flexibleMetrics[0].Name,
 				}).Error("DIAGNOSTIC: Found metrics with generic pattern")
 			} else {
 				logrus.WithFields(logrus.Fields{
-					"pattern": pattern,
-					"target":  target.URL,
+					"pattern":    flexibleQueryPattern,
+					"target_url": target.URL,
 				}).Error("DIAGNOSTIC: No metrics found for pattern using any query strategy")
 			}
 		}
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"count":  len(metrics),
-		"target": target.URL,
-		"job":    fmt.Sprintf("%s/%s", job.MetricAccess.Namespace, job.MetricAccess.Name),
+		"count":      len(metrics),
+		"target_url": target.URL,
+		"job":        fmt.Sprintf("%s/%s", job.MetricAccess.Namespace, job.MetricAccess.Name),
 	}).Error("DIAGNOSTIC: Completed metric collection from target") 
 
 	return metrics, nil
@@ -459,6 +543,7 @@ func (c *Controller) queryPromQL(client *http.Client, targetURL, query string) (
 	logrus.WithFields(logrus.Fields{
 		"query_url": queryURL,
 		"query": query,
+		"target_url": targetURL,
 	}).Error("DIAGNOSTIC: Making Prometheus query") // Use ERROR level for diagnostic visibility
 	
 	// Make the request
@@ -467,7 +552,9 @@ func (c *Controller) queryPromQL(client *http.Client, targetURL, query string) (
 		logrus.WithFields(logrus.Fields{
 			"error": err,
 			"url":   queryURL,
-		}).Error("Failed to query Prometheus")
+			"error_type": fmt.Sprintf("%T", err),
+			"error_details": err.Error(),
+		}).Error("DIAGNOSTIC: HTTP request failed")
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -477,96 +564,139 @@ func (c *Controller) queryPromQL(client *http.Client, targetURL, query string) (
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		logrus.WithFields(logrus.Fields{
 			"status_code": resp.StatusCode,
-			"body":        string(bodyBytes),
 			"url":         queryURL,
-		}).Error("Non-200 response from Prometheus")
-		return nil, fmt.Errorf("non-200 response: %d", resp.StatusCode)
+			"response":    string(bodyBytes),
+		}).Error("DIAGNOSTIC: Prometheus query returned non-200 status code")
+		return nil, fmt.Errorf("prometheus query failed with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 	
-	// Parse the response body
-	var promResp PrometheusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&promResp); err != nil {
+	// Read the response body
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
 		logrus.WithFields(logrus.Fields{
 			"error": err,
 			"url":   queryURL,
-		}).Error("Failed to decode Prometheus response")
-		return nil, err
+		}).Error("DIAGNOSTIC: Failed to read response body")
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 	
-	// Check if the status is success
+	// Log the raw response for debugging
+	logrus.WithFields(logrus.Fields{
+		"url":      queryURL,
+		"response_size": len(bodyBytes),
+		"response_preview": string(bodyBytes[:min(len(bodyBytes), 500)]), // Log first 500 chars max
+	}).Error("DIAGNOSTIC: Received Prometheus response")
+	
+	// Parse the response
+	var promResp PrometheusResponse
+	if err := json.Unmarshal(bodyBytes, &promResp); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"error": err,
+			"url":   queryURL,
+			"body":  string(bodyBytes),
+		}).Error("DIAGNOSTIC: Failed to parse Prometheus response")
+		return nil, fmt.Errorf("failed to parse prometheus response: %w", err)
+	}
+	
+	// Check the response status
 	if promResp.Status != "success" {
 		logrus.WithFields(logrus.Fields{
-			"status": promResp.Status,
 			"url":    queryURL,
-		}).Error("Prometheus query returned non-success status")
-		return nil, fmt.Errorf("prometheus query failed: %s", promResp.Status)
+			"status": promResp.Status,
+			"body":   string(bodyBytes),
+		}).Error("DIAGNOSTIC: Prometheus returned non-success status")
+		return nil, fmt.Errorf("prometheus returned non-success status: %s", promResp.Status)
 	}
 	
-	// Check if we got any data
-	resultCount := len(promResp.Data.Result)
-	logrus.WithFields(logrus.Fields{
-		"result_count": resultCount,
-		"query":        query,
-		"url":          queryURL,
-	}).Error("DIAGNOSTIC: Prometheus query result count") 
-	
-	// Extract metrics from the result
+	// Convert the results to metrics
 	var metrics []Metric
 	for _, result := range promResp.Data.Result {
-		// Extract metric name
-		metricName, ok := result.Metric["__name__"]
-		if !ok {
-			logrus.WithFields(logrus.Fields{
-				"metric": result.Metric,
-			}).Warn("Metric doesn't have a __name__ label")
-			continue
-		}
+		// Extract the metric name
+		metricName := result.Metric["__name__"]
 		
 		// Extract labels
 		labels := model.LabelSet{}
-		for k, v := range result.Metric {
-			if k != "__name__" {
-				labels[model.LabelName(k)] = model.LabelValue(v)
+		for name, value := range result.Metric {
+			if name != "__name__" {
+				labels[model.LabelName(name)] = model.LabelValue(value)
 			}
 		}
 		
-		// Extract value
+		// Extract value and timestamp
 		if len(result.Value) < 2 {
 			logrus.WithFields(logrus.Fields{
+				"url":    queryURL,
 				"metric": metricName,
-				"value":  result.Value,
-			}).Warn("Metric value is invalid")
+			}).Error("DIAGNOSTIC: Invalid value format in Prometheus response")
 			continue
 		}
 		
-		// Convert value to float64
-		strVal := result.Value[1].(string)
-		val, err := strconv.ParseFloat(strVal, 64)
-		if err != nil {
+		// Parse timestamp
+		var timestamp time.Time
+		if ts, ok := result.Value[0].(float64); ok {
+			timestamp = time.Unix(int64(ts), 0)
+		} else {
 			logrus.WithFields(logrus.Fields{
+				"url":    queryURL,
 				"metric": metricName,
-				"value":  strVal,
-				"error":  err,
-			}).Warn("Failed to parse metric value")
+				"value":  fmt.Sprintf("%v", result.Value[0]),
+			}).Error("DIAGNOSTIC: Invalid timestamp format in Prometheus response")
+			timestamp = time.Now()
+		}
+		
+		// Parse value
+		var value float64
+		switch v := result.Value[1].(type) {
+		case string:
+			parsedValue, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				logrus.WithFields(logrus.Fields{
+					"url":    queryURL,
+					"metric": metricName,
+					"value":  v,
+					"error":  err,
+				}).Error("DIAGNOSTIC: Failed to parse metric value")
+				continue
+			}
+			value = parsedValue
+		case float64:
+			value = v
+		default:
+			logrus.WithFields(logrus.Fields{
+				"url":    queryURL,
+				"metric": metricName,
+				"value":  fmt.Sprintf("%v", result.Value[1]),
+				"type":   fmt.Sprintf("%T", result.Value[1]),
+			}).Error("DIAGNOSTIC: Unexpected value type in Prometheus response")
 			continue
 		}
 		
-		logrus.WithFields(logrus.Fields{
-			"metric": metricName,
-			"labels": labels,
-			"value":  val,
-		}).Error("DIAGNOSTIC: Extracted metric")
-		
-		// Create metric
-		metrics = append(metrics, Metric{
+		// Create the metric
+		metric := Metric{
 			Name:      metricName,
 			Labels:    labels,
-			Value:     val,
-			Timestamp: time.Now(), // Use current time as timestamp
-		})
+			Value:     value,
+			Timestamp: timestamp,
+		}
+		
+		metrics = append(metrics, metric)
 	}
 	
+	logrus.WithFields(logrus.Fields{
+		"url":           queryURL,
+		"metrics_count": len(metrics),
+		"query":         query,
+	}).Error("DIAGNOSTIC: Processed Prometheus query response")
+	
 	return metrics, nil
+}
+
+// Helper function to get the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // sendMetrics sends collected metrics to the remote write target
