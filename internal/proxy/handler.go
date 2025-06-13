@@ -63,6 +63,16 @@ func NewHandler(cfg *config.Config, serviceDiscovery discovery.Discovery, tenant
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	
+	// Log all incoming requests at ERROR level for maximum visibility during debugging
+	logrus.WithFields(logrus.Fields{
+		"method":     r.Method,
+		"path":       r.URL.Path,
+		"query":      r.URL.RawQuery,
+		"remote_ip":  r.RemoteAddr,
+		"user_agent": r.UserAgent(),
+		"headers":    fmt.Sprintf("%v", r.Header),
+	}).Error("DIAGNOSTIC: Received HTTP request")
+	
 	// Create router
 	router := mux.NewRouter()
 	
@@ -88,9 +98,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Serve the request
 	router.ServeHTTP(w, r)
 	
+	// Log request completion
+	duration := time.Since(start).Seconds()
+	logrus.WithFields(logrus.Fields{
+		"method":   r.Method,
+		"path":     r.URL.Path,
+		"duration": duration,
+	}).Error("DIAGNOSTIC: Completed HTTP request")
+	
 	// Record metrics
 	if h.config.Proxy.EnableMetrics {
-		duration := time.Since(start).Seconds()
 		h.requestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration)
 		h.requestsTotal.WithLabelValues(r.Method, r.URL.Path, fmt.Sprintf("%d", 200)).Inc()
 	}
@@ -397,8 +414,8 @@ func (h *Handler) handlePrometheusAPI(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(r.URL.Path, "/api/v1/query") || strings.Contains(r.URL.Path, "/api/v1/query_range") {
 		// Process each target
 		for _, target := range targets {
-			targetURL := fmt.Sprintf("http://%s", target)
-			
+			targetURL := target.URL
+
 			// Create new request for the target
 			targetReq, err := http.NewRequest(r.Method, fmt.Sprintf("%s%s", targetURL, r.URL.RequestURI()), nil)
 			if err != nil {
@@ -416,12 +433,15 @@ func (h *Handler) handlePrometheusAPI(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Execute request
-			logrus.WithFields(logrus.Fields{
-				"target": targetURL,
-				"path":   targetReq.URL.Path,
-				"query":  targetReq.URL.RawQuery,
-			}).Debug("Sending request to target")
+			// Log request if target is pod-ip DNS
+			if strings.Contains(targetURL, ".pod.cluster.local") {
+				logrus.WithFields(logrus.Fields{
+					"target": targetURL,
+					"path":   targetReq.URL.Path,
+					"query":  targetReq.URL.RawQuery,
+					"headers": targetReq.Header,
+				}).Debug("Sending request to pod-ip DNS target")
+			}
 
 			resp, err := client.Do(targetReq)
 			if err != nil {
@@ -453,14 +473,17 @@ func (h *Handler) handlePrometheusAPI(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Log response details
-			logrus.WithFields(logrus.Fields{
-				"target":        targetURL,
-				"status":        resp.StatusCode,
-				"response_size": len(body),
-				"result_type":   result["resultType"],
-				"status_text":   result["status"],
-			}).Debug("Received response from target")
+			// Log response details if target is pod-ip DNS
+			if strings.Contains(targetURL, ".pod.cluster.local") {
+				logrus.WithFields(logrus.Fields{
+					"target":        targetURL,
+					"status":        resp.StatusCode,
+					"response_size": len(body),
+					"result_type":   result["resultType"],
+					"status_text":   result["status"],
+					"body":          string(body),
+				}).Debug("Received response from pod-ip DNS target")
+			}
 
 			// Write response to client
 			w.Header().Set("Content-Type", "application/json")
