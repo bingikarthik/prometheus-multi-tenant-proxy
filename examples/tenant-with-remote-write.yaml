@@ -1,0 +1,110 @@
+---
+# Example 1: Remote write to tenant Prometheus instance
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: webapp-metrics-remote-write
+  namespace: webapp-team
+spec:
+  metrics:
+    - "http_requests_total"
+    - "http_request_duration_seconds"
+    - "http_requests_in_flight"
+    - '{__name__=~"webapp_.*"}'
+    - "up{job=\"webapp\"}"
+  source: webapp-team
+  labelSelectors:
+    app: "webapp"
+  
+  # Remote write configuration
+  remoteWrite:
+    enabled: true
+    interval: "30s"
+    prometheus:
+      serviceName: "prometheus"
+      servicePort: 9090
+    extraLabels:
+      tenant: "webapp-team"
+      remote_write: "true"
+    honorLabels: true
+
+---
+# Example 2: Remote write to Pushgateway
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: batch-job-metrics
+  namespace: batch-processing
+spec:
+  metrics:
+    - "job_duration_seconds"
+    - "job_success_total"
+    - "job_failure_total"
+    - '{job="batch-processor"}'
+  source: batch-processing
+  
+  remoteWrite:
+    enabled: true
+    interval: "60s"
+    pushgateway:
+      serviceName: "pushgateway"
+      servicePort: 9091
+      jobName: "remote-write-batch-metrics"
+    extraLabels:
+      tenant: "batch-processing"
+
+---
+# Example 3: Remote write to external endpoint
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: external-metrics
+  namespace: monitoring-team
+spec:
+  metrics:
+    - ".*"  # All metrics for monitoring team
+  source: monitoring-team
+  
+  remoteWrite:
+    enabled: true
+    interval: "15s"
+    remoteWrite:
+      url: "https://external-prometheus.example.com/api/v1/write"
+      basicAuth:
+        username: "monitoring-user"
+        passwordSecret:
+          name: "prometheus-auth"
+          key: "password"
+      headers:
+        X-Tenant: "monitoring-team"
+    extraLabels:
+      source_cluster: "production"
+      tenant: "monitoring-team"
+
+---
+# Example 4: High-frequency remote write for critical metrics
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: critical-sla-metrics
+  namespace: sre-team
+spec:
+  metrics:
+    - "sla_availability"
+    - "sla_latency_p99"
+    - "error_rate"
+    - '{__name__=~"critical_.*"}'
+  source: sre-team
+  labelSelectors:
+    criticality: "high"
+  
+  remoteWrite:
+    enabled: true
+    interval: "5s"  # High frequency for critical metrics
+    prometheus:
+      serviceName: "sla-prometheus"
+      servicePort: 9090
+    extraLabels:
+      tenant: "sre-team"
+      priority: "critical"
+    honorLabels: true 

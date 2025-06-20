@@ -1,0 +1,27 @@
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"observability.ethos.io/v1alpha1","kind":"MetricAccess","metadata":{"annotations":{},"name":"bkarthik-metrics-simple","namespace":"ns-team-bkarthik"},"spec":{"metrics":["{__name__=~\"node_cpu_seconds_total|node_memory_MemAvailable_bytes\",job=\"node-exporter\",container=\"kube-rbac-proxy\",namespace=\"monitoring\"}"],"remoteWrite":{"enabled":true,"extraLabels":{"managed_by":"multi-tenant-proxy","tenant":"team-bkarthik"},"interval":"30s","prometheus":{"serviceName":"prometheus","servicePort":9090},"target":{"type":"prometheus"}},"source":"ns-team-bkarthik"}}
+  creationTimestamp: "2025-05-30T18:13:14Z"
+  generation: 16
+  name: bkarthik-metrics-simple
+  namespace: ns-team-bkarthik
+  resourceVersion: "4417665115"
+  uid: 369c766d-6238-42aa-8d8e-8bc64489ebd5
+spec:
+  metrics:
+  - '{__name__=~"node_cpu_seconds_total|node_memory_MemAvailable_bytes",job="node-exporter",container="kube-rbac-proxy",namespace="monitoring"}'
+  remoteWrite:
+    enabled: true
+    extraLabels:
+      managed_by: multi-tenant-proxy
+      tenant: team-bkarthik
+    interval: 30s
+    prometheus:
+      serviceName: prometheus
+      servicePort: 9090
+    target:
+      type: prometheus
+  source: ns-team-bkarthik
