@@ -89,7 +89,7 @@ func main() {
 	var remoteWriteController *remote_write.Controller
 	// Always create the controller even if remote write is disabled
 	// This ensures the /collected-metrics endpoint works even without MetricAccess resources
-	remoteWriteController = remote_write.NewController(crClient, cfg.RemoteWrite, serviceDiscovery)
+		remoteWriteController = remote_write.NewController(crClient, cfg.RemoteWrite, serviceDiscovery)
 	
 	// Start remote write controller only if enabled in config
 	enableRemoteWrite := cfg.RemoteWrite.Enabled
@@ -131,6 +131,10 @@ func main() {
 	if remoteWriteController != nil {
 		go func() {
 			if enableRemoteWrite {
+				// Wait a bit for service discovery to find initial targets
+				logrus.Info("Remote write controller waiting for service discovery to initialize...")
+				time.Sleep(10 * time.Second)
+				logrus.Info("Starting remote write controller")
 				if err := remoteWriteController.Start(ctx); err != nil {
 					logrus.Errorf("Remote write controller error: %v", err)
 				}

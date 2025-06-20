@@ -36,6 +36,15 @@ type RemoteWriteConfig struct {
 	// Target configuration for where to send metrics
 	Target RemoteWriteTarget `json:"target"`
 
+	// Prometheus target configuration (at same level as target for CRD compatibility)
+	Prometheus *PrometheusTarget `json:"prometheus,omitempty"`
+
+	// Pushgateway target configuration (at same level as target for CRD compatibility)
+	Pushgateway *PushgatewayTarget `json:"pushgateway,omitempty"`
+
+	// Remote write target configuration (at same level as target for CRD compatibility)
+	RemoteWrite *RemoteWriteEndpoint `json:"remoteWrite,omitempty"`
+
 	// Extra labels to add to all metrics
 	ExtraLabels map[string]string `json:"extraLabels,omitempty"`
 

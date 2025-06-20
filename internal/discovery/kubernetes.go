@@ -276,9 +276,9 @@ func (kd *kubernetesDiscovery) podToTargets(pod *corev1.Pod) []Target {
 	
 	// Create target URL
 	var targetURL string
-
+	
 	// Try direct IP access first - this is most reliable
-	targetURL = fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
+		targetURL = fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
 	
 	target := Target{
 		URL:      targetURL,

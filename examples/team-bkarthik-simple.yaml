@@ -8,18 +8,15 @@ spec:
   # Source identifier
   source: ns-team-bkarthik
   
-  # Metrics patterns - using namespace label
+  # Metrics patterns - using available metrics from the cluster
   metrics:
-    # All metrics from this namespace
-    - '{namespace="ns-team-bkarthik"}'
     
-    # Node metrics (if the team needs them)
-    - 'node_cpu_seconds_total'
-    - 'node_memory_MemAvailable_bytes'
-  
-  # Label selectors for additional filtering
-  labelSelectors:
-    namespace: "ns-team-bkarthik"
+    # Node and cluster metrics that are actually available
+    - 'kube_node_info'
+    - 'up'
+    - ':cluster:kube_node_unallocated_cpu_cores:sum'
+    - 'kube_pod_info'
+    - 'node_memory_Active_bytes'
 
   # Remote write configuration
   remoteWrite:

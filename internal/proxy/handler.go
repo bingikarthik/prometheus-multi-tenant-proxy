@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,7 +64,7 @@ func NewHandler(cfg *config.Config, serviceDiscovery discovery.Discovery, tenant
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	
-	// Log all incoming requests at ERROR level for maximum visibility during debugging
+	// Log all incoming requests at DEBUG level for normal operations
 	logrus.WithFields(logrus.Fields{
 		"method":     r.Method,
 		"path":       r.URL.Path,
@@ -71,7 +72,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"remote_ip":  r.RemoteAddr,
 		"user_agent": r.UserAgent(),
 		"headers":    fmt.Sprintf("%v", r.Header),
-	}).Error("DIAGNOSTIC: Received HTTP request")
+	}).Debug("DIAGNOSTIC: Received HTTP request")
 	
 	// Create router
 	router := mux.NewRouter()
@@ -104,7 +105,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"method":   r.Method,
 		"path":     r.URL.Path,
 		"duration": duration,
-	}).Error("DIAGNOSTIC: Completed HTTP request")
+	}).Debug("DIAGNOSTIC: Completed HTTP request")
 	
 	// Record metrics
 	if h.config.Proxy.EnableMetrics {
@@ -181,184 +182,46 @@ func (h *Handler) handleDebugTenants(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleCollectedMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	
+	// Always log the request for debugging
+	logrus.WithFields(logrus.Fields{
+		"path":  r.URL.Path,
+		"query": r.URL.RawQuery,
+	}).Info("DIAGNOSTIC: Processing /collected-metrics request")
+	
 	// Check if remoteWriteController is available
 	if h.remoteWriteController == nil {
+		logrus.Warn("DIAGNOSTIC: No remote write controller available")
 		fmt.Fprintf(w, "# No remote write controller available. RemoteWrite feature may be disabled.\n")
+		fmt.Fprintf(w, "# Attempting direct Prometheus query fallback...\n\n")
+		// Force fallback mechanism
+		h.executeDirectPrometheusQuery(w, r)
 		return
 	}
 	
 	// Get metrics from remote write controller
 	metrics := h.remoteWriteController.GetAllCollectedMetrics()
+	logrus.WithFields(logrus.Fields{
+		"metrics_count": len(metrics),
+	}).Info("DIAGNOSTIC: Retrieved metrics from remote write controller")
 	
-	// If no metrics are available, try to fetch directly from target
+	// FORCE FALLBACK: Always use direct query if no metrics found OR for debugging
 	if len(metrics) == 0 {
+		logrus.Info("DIAGNOSTIC: No metrics from remote write controller, using direct Prometheus query")
 		fmt.Fprintf(w, "# No collected metrics found in remote write controller.\n")
 		fmt.Fprintf(w, "# Attempting to fetch metrics directly from Prometheus backend.\n\n")
 		
-		// Get a backend target
-		targets := h.serviceDiscovery.GetTargets()
-		if len(targets) == 0 {
-			fmt.Fprintf(w, "# No backend targets available.\n")
-			return
-		}
-		
-		// Pick the first healthy target
-		var target discovery.Target
-		for _, t := range targets {
-			if t.Healthy {
-				target = t
-				break
-			}
-		}
-		
-		if target.URL == "" {
-			fmt.Fprintf(w, "# No healthy backend targets available.\n")
-			return
-		}
-		
-		// Get metric name from query parameter if provided
-		queryMetric := r.URL.Query().Get("metric")
-		
-		// List of common metric types to fetch if no specific metric is requested
-		metricTypes := []string{
-			// System-level metrics
-			"node_memory_MemAvailable_bytes",
-			"node_cpu_seconds_total{mode=\"user\"}",
-			"node_filesystem_avail_bytes",
-			
-			// Kubernetes API server metrics
-			"apiserver_request_total",
-			"apiserver_request_duration_seconds_count",
-			
-			// Pod/container metrics
-			"container_cpu_usage_seconds_total",
-			"container_memory_usage_bytes",
-			"kube_pod_status_phase",
-			
-			// Service/endpoint metrics
-			"kube_service_info",
-			"kube_endpoint_info",
-		}
-		
-		client := &http.Client{Timeout: 10 * time.Second}
-		allResults := make(map[string][]byte)
-		
-		// If specific metric requested, only query that one
-		if queryMetric != "" {
-			metricTypes = []string{queryMetric}
-		}
-		
-		// Fetch each metric type
-		for _, metricType := range metricTypes {
-			queryURL := fmt.Sprintf("%s/api/v1/query?query=%s", target.URL, url.QueryEscape(metricType))
-			resp, err := client.Get(queryURL)
-			if err != nil {
-				fmt.Fprintf(w, "# Error querying backend for %s: %v\n", metricType, err)
-				continue
-			}
-			
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			
-			if err != nil {
-				fmt.Fprintf(w, "# Error reading response for %s: %v\n", metricType, err)
-				continue
-			}
-			
-			// Store the result
-			allResults[metricType] = body
-		}
-		
-		// If no results were fetched, return error
-		if len(allResults) == 0 {
-			fmt.Fprintf(w, "# No metrics could be fetched from backend\n")
-			return
-		}
-		
-		// Process and output all results
-		for metricType, body := range allResults {
-			fmt.Fprintf(w, "# Metric: %s\n", metricType)
-			
-			// Parse the Prometheus response
-			var promResp struct {
-				Status string `json:"status"`
-				Data   struct {
-					ResultType string `json:"resultType"`
-					Result     []struct {
-						Metric map[string]string `json:"metric"`
-						Value  []interface{}     `json:"value"`
-					} `json:"result"`
-				} `json:"data"`
-			}
-			
-			if err := json.Unmarshal(body, &promResp); err != nil {
-				fmt.Fprintf(w, "# Error parsing response: %v\n", err)
-				continue
-			}
-			
-			// Format as Prometheus text format
-			if promResp.Status == "success" {
-				resultCount := 0
-				for _, result := range promResp.Data.Result {
-					// Build label string
-					var labels []string
-					for name, value := range result.Metric {
-						labels = append(labels, fmt.Sprintf("%s=%q", name, value))
-					}
-					labelStr := ""
-					if len(labels) > 0 {
-						labelStr = fmt.Sprintf("{%s}", strings.Join(labels, ","))
-					}
-					
-					// Get value and timestamp
-					var value float64
-					var timestamp int64
-					
-					if len(result.Value) >= 2 {
-						// Convert timestamp (first element)
-						if ts, ok := result.Value[0].(float64); ok {
-							timestamp = int64(ts * 1000) // Convert to milliseconds
-						}
-						
-						// Convert value (second element)
-						if val, ok := result.Value[1].(string); ok {
-							parsedVal, err := strconv.ParseFloat(val, 64)
-							if err == nil {
-								value = parsedVal
-							}
-						}
-					}
-					
-					// Output in Prometheus text format
-					metricName := result.Metric["__name__"]
-					if metricName == "" {
-						// Use the query if no name is found
-						metricName = strings.Split(metricType, "{")[0]
-					}
-					fmt.Fprintf(w, "%s%s %g %d\n", metricName, labelStr, value, timestamp)
-					resultCount++
-					
-					// Limit to 5 results per metric type to avoid overwhelming output
-					if resultCount >= 5 && !strings.HasPrefix(metricType, "apiserver_") {
-						fmt.Fprintf(w, "# ... more results omitted (limited to 5 samples per metric type)\n")
-						break
-					}
-				}
-				
-				if len(promResp.Data.Result) == 0 {
-					fmt.Fprintf(w, "# No data found for this metric\n")
-				}
-				
-				fmt.Fprintf(w, "\n")
-			} else {
-				fmt.Fprintf(w, "# Error from Prometheus: %s\n\n", promResp.Status)
-			}
-		}
+		h.executeDirectPrometheusQuery(w, r)
 		return
 	}
 	
 	// If we have metrics from the remote write controller, display them
-	for _, jobMetrics := range metrics {
+	logrus.WithFields(logrus.Fields{
+		"jobs_count": len(metrics),
+	}).Info("DIAGNOSTIC: Displaying metrics from remote write controller")
+	
+	totalMetricsDisplayed := 0
+	for jobKey, jobMetrics := range metrics {
+		fmt.Fprintf(w, "# Job: %s (%d metrics)\n", jobKey, len(jobMetrics))
 		for _, metric := range jobMetrics {
 			// Build label string
 			var labels []string
@@ -376,8 +239,248 @@ func (h *Handler) handleCollectedMetrics(w http.ResponseWriter, r *http.Request)
 				labelStr,
 				metric.Value,
 				metric.Timestamp.UnixNano()/int64(time.Millisecond))
+			totalMetricsDisplayed++
+		}
+		fmt.Fprintf(w, "\n")
+	}
+	
+	logrus.WithFields(logrus.Fields{
+		"total_metrics": totalMetricsDisplayed,
+	}).Info("DIAGNOSTIC: Completed displaying remote write controller metrics")
+}
+
+// executeDirectPrometheusQuery performs direct queries to Prometheus targets
+func (h *Handler) executeDirectPrometheusQuery(w http.ResponseWriter, r *http.Request) {
+	// Get a backend target
+	targets := h.serviceDiscovery.GetTargets()
+	logrus.WithFields(logrus.Fields{
+		"targets_count": len(targets),
+	}).Debug("DIAGNOSTIC: Retrieved targets for direct query")
+	
+	if len(targets) == 0 {
+		logrus.Warn("DIAGNOSTIC: No backend targets available")
+		fmt.Fprintf(w, "# No backend targets available.\n")
+		return
+	}
+	
+	// Pick the first healthy target
+	var target discovery.Target
+	healthyCount := 0
+	for _, t := range targets {
+		if t.Healthy {
+			if target.URL == "" {
+				target = t // Use first healthy target
+			}
+			healthyCount++
 		}
 	}
+	
+	logrus.WithFields(logrus.Fields{
+		"healthy_targets": healthyCount,
+		"selected_target": target.URL,
+	}).Debug("DIAGNOSTIC: Selected target for direct query")
+	
+	if target.URL == "" {
+		logrus.Warn("DIAGNOSTIC: No healthy backend targets available")
+		fmt.Fprintf(w, "# No healthy backend targets available.\n")
+		fmt.Fprintf(w, "# Total targets: %d, Healthy targets: %d\n", len(targets), healthyCount)
+		return
+	}
+	
+	// Get metric name from query parameter if provided
+	queryMetric := r.URL.Query().Get("metric")
+	
+	// List of common metric types to fetch if no specific metric is requested
+	metricTypes := []string{
+		// System-level metrics that should be available on prometheus-k8s-d
+		"node_memory_MemAvailable_bytes",
+		"node_cpu_seconds_total",
+		"node_filesystem_avail_bytes",
+		
+		// Kubernetes API server metrics
+		"apiserver_request_total",
+		"apiserver_request_duration_seconds_count",
+		
+		// Pod/container metrics
+		"container_cpu_usage_seconds_total",
+		"container_memory_usage_bytes",
+		"kube_pod_status_phase",
+		
+		// Service/endpoint metrics
+		"kube_service_info",
+		"kube_endpoint_info",
+	}
+	
+	// If specific metric requested, only query that one
+	if queryMetric != "" {
+		metricTypes = []string{queryMetric}
+		logrus.WithFields(logrus.Fields{
+			"requested_metric": queryMetric,
+		}).Info("DIAGNOSTIC: Using specific metric from query parameter")
+	}
+	
+	client := &http.Client{Timeout: 30 * time.Second}
+	allResults := make(map[string][]byte)
+	successCount := 0
+	
+	// Fetch each metric type
+	for _, metricType := range metricTypes {
+		queryURL := fmt.Sprintf("%s/api/v1/query?query=%s", target.URL, url.QueryEscape(metricType))
+		
+		logrus.WithFields(logrus.Fields{
+			"metric_type": metricType,
+			"query_url":   queryURL,
+		}).Debug("DIAGNOSTIC: Executing direct Prometheus query")
+		
+		resp, err := client.Get(queryURL)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"metric_type": metricType,
+				"error":       err.Error(),
+			}).Error("DIAGNOSTIC: Failed to query Prometheus target")
+			fmt.Fprintf(w, "# Error querying backend for %s: %v\n", metricType, err)
+			continue
+		}
+		
+		body, err := h.readResponseBody(resp)
+		resp.Body.Close()
+		
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"metric_type": metricType,
+				"error":       err.Error(),
+			}).Error("DIAGNOSTIC: Failed to read response body")
+			fmt.Fprintf(w, "# Error reading response for %s: %v\n", metricType, err)
+			continue
+		}
+		
+		logrus.WithFields(logrus.Fields{
+			"metric_type":     metricType,
+			"response_size":   len(body),
+			"response_status": resp.StatusCode,
+		}).Debug("DIAGNOSTIC: Received response from Prometheus")
+		
+		// Store the result
+		allResults[metricType] = body
+		successCount++
+	}
+	
+	logrus.WithFields(logrus.Fields{
+		"total_queries":     len(metricTypes),
+		"successful_queries": successCount,
+	}).Info("DIAGNOSTIC: Completed all Prometheus queries")
+	
+	// If no results were fetched, return error
+	if len(allResults) == 0 {
+		logrus.Warn("DIAGNOSTIC: No metrics could be fetched from backend")
+		fmt.Fprintf(w, "# No metrics could be fetched from backend\n")
+		fmt.Fprintf(w, "# Target: %s\n", target.URL)
+		fmt.Fprintf(w, "# Attempted %d metric types\n", len(metricTypes))
+		return
+	}
+	
+	totalMetricsDisplayed := 0
+	
+	// Process and output all results
+	for metricType, body := range allResults {
+		fmt.Fprintf(w, "# Metric: %s\n", metricType)
+		
+		// Parse the Prometheus response
+		var promResp struct {
+			Status string `json:"status"`
+			Data   struct {
+				ResultType string `json:"resultType"`
+				Result     []struct {
+					Metric map[string]string `json:"metric"`
+					Value  []interface{}     `json:"value"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		
+		if err := json.Unmarshal(body, &promResp); err != nil {
+			logrus.WithFields(logrus.Fields{
+				"metric_type": metricType,
+				"error":       err.Error(),
+			}).Error("DIAGNOSTIC: Failed to parse Prometheus response")
+			fmt.Fprintf(w, "# Error parsing response: %v\n", err)
+			continue
+		}
+		
+		// Format as Prometheus text format
+		if promResp.Status == "success" {
+			resultCount := 0
+			logrus.WithFields(logrus.Fields{
+				"metric_type":   metricType,
+				"result_count":  len(promResp.Data.Result),
+			}).Debug("DIAGNOSTIC: Processing successful Prometheus response")
+			
+			for _, result := range promResp.Data.Result {
+				// Build label string
+				var labels []string
+				for name, value := range result.Metric {
+					labels = append(labels, fmt.Sprintf("%s=%q", name, value))
+				}
+				labelStr := ""
+				if len(labels) > 0 {
+					labelStr = fmt.Sprintf("{%s}", strings.Join(labels, ","))
+				}
+				
+				// Get value and timestamp
+				var value float64
+				var timestamp int64
+				
+				if len(result.Value) >= 2 {
+					// Convert timestamp (first element)
+					if ts, ok := result.Value[0].(float64); ok {
+						timestamp = int64(ts * 1000) // Convert to milliseconds
+					}
+					
+					// Convert value (second element)
+					if val, ok := result.Value[1].(string); ok {
+						parsedVal, err := strconv.ParseFloat(val, 64)
+						if err == nil {
+							value = parsedVal
+						}
+					}
+				}
+				
+				// Output in Prometheus text format
+				metricName := result.Metric["__name__"]
+				if metricName == "" {
+					// Use the query if no name is found
+					metricName = strings.Split(metricType, "{")[0]
+				}
+				fmt.Fprintf(w, "%s%s %g %d\n", metricName, labelStr, value, timestamp)
+				resultCount++
+				totalMetricsDisplayed++
+				
+				// Limit to 10 results per metric type to avoid overwhelming output
+				if resultCount >= 10 && !strings.HasPrefix(metricType, "apiserver_") {
+					fmt.Fprintf(w, "# ... more results omitted (limited to 10 samples per metric type)\n")
+					break
+				}
+			}
+			
+			if len(promResp.Data.Result) == 0 {
+				logrus.WithFields(logrus.Fields{
+					"metric_type": metricType,
+				}).Debug("DIAGNOSTIC: No data found for metric type")
+				fmt.Fprintf(w, "# No data found for this metric\n")
+			}
+			
+			fmt.Fprintf(w, "\n")
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"metric_type": metricType,
+				"status":      promResp.Status,
+			}).Error("DIAGNOSTIC: Prometheus returned non-success status")
+			fmt.Fprintf(w, "# Error from Prometheus: %s\n\n", promResp.Status)
+		}
+	}
+	
+	logrus.WithFields(logrus.Fields{
+		"total_metrics_displayed": totalMetricsDisplayed,
+	}).Info("DIAGNOSTIC: Completed direct Prometheus query results")
 }
 
 // handlePrometheusAPI handles Prometheus API requests
@@ -412,88 +515,18 @@ func (h *Handler) handlePrometheusAPI(w http.ResponseWriter, r *http.Request) {
 
 	// Only handle query and query_range endpoints
 	if strings.Contains(r.URL.Path, "/api/v1/query") || strings.Contains(r.URL.Path, "/api/v1/query_range") {
-		// Process each target
-		for _, target := range targets {
-			targetURL := target.URL
-
-			// Create new request for the target
-			targetReq, err := http.NewRequest(r.Method, fmt.Sprintf("%s%s", targetURL, r.URL.RequestURI()), nil)
-			if err != nil {
-				logrus.WithFields(logrus.Fields{
-					"target": targetURL,
-					"error":  err,
-				}).Error("Failed to create target request")
-				continue
-			}
-
-			// Copy headers
-			for key, values := range r.Header {
-				for _, value := range values {
-					targetReq.Header.Add(key, value)
-				}
-			}
-
-			// Log request if target is pod-ip DNS
-			if strings.Contains(targetURL, ".pod.cluster.local") {
-				logrus.WithFields(logrus.Fields{
-					"target": targetURL,
-					"path":   targetReq.URL.Path,
-					"query":  targetReq.URL.RawQuery,
-					"headers": targetReq.Header,
-				}).Debug("Sending request to pod-ip DNS target")
-			}
-
-			resp, err := client.Do(targetReq)
-			if err != nil {
-				logrus.WithFields(logrus.Fields{
-					"target": targetURL,
-					"error":  err,
-				}).Error("Failed to execute request")
-				continue
-			}
-			defer resp.Body.Close()
-
-			// Read response body
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				logrus.WithFields(logrus.Fields{
-					"target": targetURL,
-					"error":  err,
-				}).Error("Failed to read response body")
-				continue
-			}
-
-			// Parse and log response
-			var result map[string]interface{}
-			if err := json.Unmarshal(body, &result); err != nil {
-				logrus.WithFields(logrus.Fields{
-					"target": targetURL,
-					"error":  err,
-				}).Error("Failed to parse response JSON")
-				continue
-			}
-
-			// Log response details if target is pod-ip DNS
-			if strings.Contains(targetURL, ".pod.cluster.local") {
-				logrus.WithFields(logrus.Fields{
-					"target":        targetURL,
-					"status":        resp.StatusCode,
-					"response_size": len(body),
-					"result_type":   result["resultType"],
-					"status_text":   result["status"],
-					"body":          string(body),
-				}).Debug("Received response from pod-ip DNS target")
-			}
-
-			// Write response to client
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			w.Write(body)
+		// Query all targets and aggregate results
+		aggregatedResults := h.queryAllTargetsAndAggregate(client, targets, r)
+		
+		if aggregatedResults == nil {
+			h.writeError(w, http.StatusServiceUnavailable, "No successful responses from any target")
 			return
 		}
 		
-		// If we get here, no targets responded successfully
-		h.writeError(w, http.StatusServiceUnavailable, "No successful responses from any target")
+		// Return aggregated results
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(aggregatedResults)
 		return
 	} else {
 		// For non-query endpoints, use standard load balancing
@@ -504,8 +537,7 @@ func (h *Handler) handlePrometheusAPI(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Create reverse proxy
-		targetURL := fmt.Sprintf("http://%s", target)
-		proxyURL, err := url.Parse(targetURL)
+		proxyURL, err := url.Parse(target.URL)
 		if err != nil {
 			h.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to parse target URL: %v", err))
 			return
@@ -535,7 +567,7 @@ func (h *Handler) proxyToTarget(w http.ResponseWriter, r *http.Request, target *
 			"path":      r.URL.Path,
 			"target":    target.URL,
 			"remote_ip": r.RemoteAddr,
-		}).Error("Proxying request to single target")
+		}).Info("Proxying request to single target")
 	}
 
 	// Record backend metrics
@@ -549,6 +581,30 @@ func (h *Handler) proxyToTarget(w http.ResponseWriter, r *http.Request, target *
 
 // extractTenantInfo extracts tenant information from the request
 func (h *Handler) extractTenantInfo(r *http.Request) (*tenant.TenantInfo, error) {
+	// Check for internal collection bypass header first
+	if r.Header.Get("X-Internal-Collection") == "true" {
+		logrus.WithFields(logrus.Fields{
+			"path":       r.URL.Path,
+			"user_agent": r.Header.Get("User-Agent"),
+		}).Info("DIAGNOSTIC: Bypassing tenant filtering for internal collection")
+		
+		// Return a special internal tenant that has access to all metrics
+		return &tenant.TenantInfo{
+			ID:             "internal-collection",
+			Name:           "Internal Collection Service",
+			Namespace:      "internal-collection",
+			MetricPatterns: []tenant.MetricPattern{
+				{
+					Pattern: ".*",  // Match all metrics
+					Type:    tenant.PatternTypeRegex,
+				},
+			},
+			Source:         "internal",
+			LabelSelectors: map[string]string{}, // No label restrictions
+			LastUpdated:    time.Now(),
+		}, nil
+	}
+	
 	// Try to extract tenant from different sources
 	
 	// 1. From X-Tenant-Namespace header
@@ -665,4 +721,174 @@ func (h *Handler) initMetrics() {
 	prometheus.MustRegister(h.requestsTotal)
 	prometheus.MustRegister(h.requestDuration)
 	prometheus.MustRegister(h.backendRequests)
-} 
+}
+
+// queryAllTargetsAndAggregate queries all targets and aggregates successful responses
+func (h *Handler) queryAllTargetsAndAggregate(client *http.Client, targets []discovery.Target, r *http.Request) []byte {
+	type targetResponse struct {
+		target   string
+		response map[string]interface{}
+		success  bool
+	}
+	
+	responses := make([]targetResponse, 0, len(targets))
+	successCount := 0
+	
+	// Query all targets
+	for _, target := range targets {
+		targetURL := target.URL
+		
+		// Create new request for the target
+		targetReq, err := http.NewRequest(r.Method, fmt.Sprintf("%s%s", targetURL, r.URL.RequestURI()), nil)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"target": targetURL,
+				"error":  err,
+			}).Debug("Failed to create target request")
+			continue
+		}
+		
+		// Copy headers
+		for key, values := range r.Header {
+			for _, value := range values {
+				targetReq.Header.Add(key, value)
+			}
+		}
+		
+		resp, err := client.Do(targetReq)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"target": targetURL,
+				"error":  err,
+			}).Debug("Failed to execute request to target")
+			continue
+		}
+		
+		// Read response body with gzip decompression support
+		body, err := h.readResponseBody(resp)
+		resp.Body.Close()
+		
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"target": targetURL,
+				"error":  err,
+			}).Debug("Failed to read response body from target")
+			continue
+		}
+		
+		// Parse response
+		var result map[string]interface{}
+		if err := json.Unmarshal(body, &result); err != nil {
+			logrus.WithFields(logrus.Fields{
+				"target": targetURL,
+				"error":  err,
+			}).Debug("Failed to parse response JSON from target")
+			continue
+		}
+		
+		// Check if response is successful and has results
+		if status, ok := result["status"].(string); ok && status == "success" {
+			if data, ok := result["data"].(map[string]interface{}); ok {
+				if resultArray, ok := data["result"].([]interface{}); ok {
+					logrus.WithFields(logrus.Fields{
+						"target":       targetURL,
+						"status":       resp.StatusCode,
+						"result_count": len(resultArray),
+					}).Debug("Successful response from target")
+					
+					responses = append(responses, targetResponse{
+						target:   targetURL,
+						response: result,
+						success:  true,
+					})
+					successCount++
+				}
+			}
+		}
+	}
+	
+	logrus.WithFields(logrus.Fields{
+		"total_targets":      len(targets),
+		"successful_targets": successCount,
+	}).Debug("Completed querying all targets")
+	
+	if successCount == 0 {
+		return nil
+	}
+	
+	// Aggregate results from all successful responses
+	aggregatedResult := map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"resultType": "vector",
+			"result":     []interface{}{},
+		},
+	}
+	
+	var allResults []interface{}
+	totalMetrics := 0
+	
+	for _, resp := range responses {
+		if !resp.success {
+			continue
+		}
+		
+		if data, ok := resp.response["data"].(map[string]interface{}); ok {
+			if resultArray, ok := data["result"].([]interface{}); ok {
+				allResults = append(allResults, resultArray...)
+				totalMetrics += len(resultArray)
+				
+				logrus.WithFields(logrus.Fields{
+					"target":        resp.target,
+					"metrics_count": len(resultArray),
+				}).Debug("Added metrics from target to aggregated result")
+			}
+		}
+	}
+	
+	// Set aggregated results
+	if dataMap, ok := aggregatedResult["data"].(map[string]interface{}); ok {
+		dataMap["result"] = allResults
+	}
+	
+	logrus.WithFields(logrus.Fields{
+		"total_metrics":      totalMetrics,
+		"successful_targets": successCount,
+	}).Info("Aggregated results from all targets")
+	
+	// Convert back to JSON
+	aggregatedJSON, err := json.Marshal(aggregatedResult)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"error": err,
+		}).Error("Failed to marshal aggregated results")
+		return nil
+	}
+	
+	return aggregatedJSON
+}
+
+// readResponseBody reads and decompresses HTTP response body if needed
+func (h *Handler) readResponseBody(resp *http.Response) ([]byte, error) {
+	var reader io.Reader = resp.Body
+	
+	// Check if response is gzipped
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gzipReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %v", err)
+		}
+		defer gzipReader.Close()
+		reader = gzipReader
+	}
+	
+	return io.ReadAll(reader)
+}
+
+// min returns the smaller of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

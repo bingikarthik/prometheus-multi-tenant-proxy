@@ -47,7 +47,7 @@ func NewPrometheusCollector(client client.Client) Collector {
 // Send implements the Collector interface for Prometheus targets
 func (c *PrometheusCollector) Send(ctx context.Context, metricAccess *v1alpha1.MetricAccess, metrics []Metric) error {
 	// Get the Prometheus target configuration
-	target := metricAccess.Spec.RemoteWrite.Target.Prometheus
+	target := metricAccess.Spec.RemoteWrite.Prometheus
 	if target == nil {
 		return fmt.Errorf("prometheus target configuration is missing")
 	}
@@ -62,6 +62,14 @@ func (c *PrometheusCollector) Send(ctx context.Context, metricAccess *v1alpha1.M
 		target.ServiceName, 
 		metricAccess.Namespace, 
 		port)
+	
+	logrus.WithFields(logrus.Fields{
+		"url":           url,
+		"namespace":     metricAccess.Namespace,
+		"service":       target.ServiceName,
+		"port":          port,
+		"metric_count":  len(metrics),
+	}).Info("DIAGNOSTIC: Sending metrics via remote write to Prometheus")
 	
 	// Convert metrics to Prometheus remote write format
 	var timeseries []prompb.TimeSeries
@@ -134,6 +142,11 @@ func (c *PrometheusCollector) Send(ctx context.Context, metricAccess *v1alpha1.M
 		resp, err := client.Do(httpReq)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to send request: %w", err)
+			logrus.WithFields(logrus.Fields{
+				"url":     url,
+				"retry":   retries + 1,
+				"error":   err,
+			}).Warning("DIAGNOSTIC: Remote write request failed, retrying")
 			time.Sleep(time.Second * time.Duration(retries+1))
 			continue
 		}
@@ -142,6 +155,12 @@ func (c *PrometheusCollector) Send(ctx context.Context, metricAccess *v1alpha1.M
 		if resp.StatusCode/100 != 2 {
 			body, _ := io.ReadAll(resp.Body)
 			lastErr = fmt.Errorf("remote write failed with status %d: %s", resp.StatusCode, string(body))
+			logrus.WithFields(logrus.Fields{
+				"url":        url,
+				"status":     resp.StatusCode,
+				"response":   string(body),
+				"retry":      retries + 1,
+			}).Warning("DIAGNOSTIC: Remote write response error, retrying")
 			time.Sleep(time.Second * time.Duration(retries+1))
 			continue
 		}
@@ -152,9 +171,18 @@ func (c *PrometheusCollector) Send(ctx context.Context, metricAccess *v1alpha1.M
 			"namespace":     metricAccess.Namespace,
 			"service":       target.ServiceName,
 			"metric_count": len(metrics),
-		}).Debug("Successfully sent metrics via remote write")
+			"status":        resp.StatusCode,
+		}).Info("DIAGNOSTIC: Successfully sent metrics via remote write")
 		return nil
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"url":           url,
+		"namespace":     metricAccess.Namespace,
+		"service":       target.ServiceName,
+		"metric_count":  len(metrics),
+		"final_error":   lastErr,
+	}).Error("DIAGNOSTIC: Failed to send metrics after all retries")
 
 	return fmt.Errorf("failed to send metrics after retries: %w", lastErr)
 }
