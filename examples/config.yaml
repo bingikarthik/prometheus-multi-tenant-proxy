@@ -23,7 +23,7 @@ discovery:
     # Resource types to discover
     resource_types:
       - Service
-      - Pod
+      - Pod 
   
   # How often to refresh the list of targets
   refresh_interval: 30s
