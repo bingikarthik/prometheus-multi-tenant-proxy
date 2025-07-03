@@ -516,7 +516,7 @@ func (h *Handler) handlePrometheusAPI(w http.ResponseWriter, r *http.Request) {
 	// Only handle query and query_range endpoints
 	if strings.Contains(r.URL.Path, "/api/v1/query") || strings.Contains(r.URL.Path, "/api/v1/query_range") {
 		// Query all targets and aggregate results
-		aggregatedResults := h.queryAllTargetsAndAggregate(client, targets, r)
+		aggregatedResults := h.queryAllTargetsAndAggregate(client, targets, r, tenantInfo)
 		
 		if aggregatedResults == nil {
 			h.writeError(w, http.StatusServiceUnavailable, "No successful responses from any target")
@@ -666,20 +666,84 @@ func (h *Handler) filterQueryResponse(resp *http.Response, tenantInfo *tenant.Te
 	}
 	resp.Body.Close()
 	
-	// TODO: Parse the Prometheus response and filter metrics based on tenant access rules
-	// This is a complex operation that would involve:
-	// 1. Parsing the JSON response
-	// 2. Extracting metric names and labels from the result
-	// 3. Validating each metric against tenant access rules
-	// 4. Filtering out unauthorized metrics
-	// 5. Reconstructing the response
+	// Parse the Prometheus response
+	var response map[string]interface{}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return fmt.Errorf("failed to parse response JSON: %w", err)
+	}
 	
-	// For now, we'll pass through the response as-is
-	// In a production implementation, you'd want to implement proper filtering
+	// Check if response has the expected structure
+	data, ok := response["data"].(map[string]interface{})
+	if !ok {
+		// If not a standard query response, pass through as-is
+		resp.Body = io.NopCloser(strings.NewReader(string(body)))
+		resp.ContentLength = int64(len(body))
+		return nil
+	}
 	
-	// Create a new response body
-	resp.Body = io.NopCloser(strings.NewReader(string(body)))
-	resp.ContentLength = int64(len(body))
+	result, ok := data["result"].([]interface{})
+	if !ok {
+		// If no result array, pass through as-is
+		resp.Body = io.NopCloser(strings.NewReader(string(body)))
+		resp.ContentLength = int64(len(body))
+		return nil
+	}
+	
+	// Filter the results based on tenant access rules
+	var filteredResults []interface{}
+	filteredCount := 0
+	
+	for _, item := range result {
+		if resultItem, ok := item.(map[string]interface{}); ok {
+			// Extract metric information
+			metric, ok := resultItem["metric"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			
+			// Get metric name
+			metricName := ""
+			if name, ok := metric["__name__"].(string); ok {
+				metricName = name
+			}
+			
+			// Convert metric labels to string map
+			labels := make(map[string]string)
+			for key, value := range metric {
+				if strValue, ok := value.(string); ok {
+					labels[key] = strValue
+				}
+			}
+			
+			// Validate access using tenant manager
+			if h.tenantManager.ValidateAccess(tenantInfo.ID, metricName, labels) {
+				filteredResults = append(filteredResults, item)
+				filteredCount++
+			}
+		}
+	}
+	
+	// Log filtering results
+	logrus.WithFields(logrus.Fields{
+		"tenant_id":        tenantInfo.ID,
+		"original_count":   len(result),
+		"filtered_count":   filteredCount,
+		"filtered_out":     len(result) - filteredCount,
+	}).Debug("Filtered query response based on tenant access rules")
+	
+	// Update the response with filtered results
+	data["result"] = filteredResults
+	response["data"] = data
+	
+	// Marshal the filtered response back to JSON
+	filteredBody, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal filtered response: %w", err)
+	}
+	
+	// Create a new response body with filtered content
+	resp.Body = io.NopCloser(strings.NewReader(string(filteredBody)))
+	resp.ContentLength = int64(len(filteredBody))
 	
 	return nil
 }
@@ -724,7 +788,7 @@ func (h *Handler) initMetrics() {
 }
 
 // queryAllTargetsAndAggregate queries all targets and aggregates successful responses
-func (h *Handler) queryAllTargetsAndAggregate(client *http.Client, targets []discovery.Target, r *http.Request) []byte {
+func (h *Handler) queryAllTargetsAndAggregate(client *http.Client, targets []discovery.Target, r *http.Request, tenantInfo *tenant.TenantInfo) []byte {
 	type targetResponse struct {
 		target   string
 		response map[string]interface{}
@@ -827,6 +891,7 @@ func (h *Handler) queryAllTargetsAndAggregate(client *http.Client, targets []dis
 	
 	var allResults []interface{}
 	totalMetrics := 0
+	filteredMetrics := 0
 	
 	for _, resp := range responses {
 		if !resp.success {
@@ -835,13 +900,48 @@ func (h *Handler) queryAllTargetsAndAggregate(client *http.Client, targets []dis
 		
 		if data, ok := resp.response["data"].(map[string]interface{}); ok {
 			if resultArray, ok := data["result"].([]interface{}); ok {
-				allResults = append(allResults, resultArray...)
+				// Filter results based on tenant access rules
+				var filteredResults []interface{}
+				
+				for _, item := range resultArray {
+					if resultItem, ok := item.(map[string]interface{}); ok {
+						// Extract metric information
+						metric, ok := resultItem["metric"].(map[string]interface{})
+						if !ok {
+							continue
+						}
+						
+						// Get metric name
+						metricName := ""
+						if name, ok := metric["__name__"].(string); ok {
+							metricName = name
+						}
+						
+						// Convert metric labels to string map
+						labels := make(map[string]string)
+						for key, value := range metric {
+							if strValue, ok := value.(string); ok {
+								labels[key] = strValue
+							}
+						}
+						
+						// Validate access using tenant manager
+						if h.tenantManager.ValidateAccess(tenantInfo.ID, metricName, labels) {
+							filteredResults = append(filteredResults, item)
+							filteredMetrics++
+						}
+					}
+				}
+				
+				allResults = append(allResults, filteredResults...)
 				totalMetrics += len(resultArray)
 				
 				logrus.WithFields(logrus.Fields{
-					"target":        resp.target,
-					"metrics_count": len(resultArray),
-				}).Debug("Added metrics from target to aggregated result")
+					"target":           resp.target,
+					"original_count":   len(resultArray),
+					"filtered_count":   len(filteredResults),
+					"tenant_id":        tenantInfo.ID,
+				}).Debug("Added filtered metrics from target to aggregated result")
 			}
 		}
 	}
@@ -853,8 +953,10 @@ func (h *Handler) queryAllTargetsAndAggregate(client *http.Client, targets []dis
 	
 	logrus.WithFields(logrus.Fields{
 		"total_metrics":      totalMetrics,
+		"filtered_metrics":   filteredMetrics,
 		"successful_targets": successCount,
-	}).Info("Aggregated results from all targets")
+		"tenant_id":          tenantInfo.ID,
+	}).Info("Aggregated and filtered results from all targets")
 	
 	// Convert back to JSON
 	aggregatedJSON, err := json.Marshal(aggregatedResult)
