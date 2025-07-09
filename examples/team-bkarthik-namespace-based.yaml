@@ -34,19 +34,15 @@ spec:
     - 'node_cpu_seconds_total'
     - 'node_memory_MemAvailable_bytes'
   
-  # Label selectors can add additional filtering
-  labelSelectors:
-    namespace: "ns-team-bkarthik"
-  
   # Remote write to team's Prometheus
   remoteWrite:
     enabled: true
     interval: "30s"
     target:
       type: "prometheus"
-      prometheus:
-        serviceName: "prometheus-test"
-        servicePort: 9090
+    prometheus:
+      serviceName: "prometheus-test"
+      servicePort: 9090
     extraLabels:
       tenant: "team-bkarthik"
       managed_by: "multi-tenant-proxy"
@@ -75,8 +71,50 @@ spec:
     interval: "30s"
     target:
       type: "prometheus"
-      prometheus:
-        serviceName: "prometheus-test"
-        servicePort: 9090
+    prometheus:
+      serviceName: "prometheus-test"
+      servicePort: 9090
     extraLabels:
-      tenant: "team-bkarthik" 
+      tenant: "team-bkarthik"
+      managed_by: "multi-tenant-proxy"
+
+---
+# Example 3: Mixed approach - namespace filtering with additional patterns
+apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: bkarthik-metrics-mixed
+  namespace: ns-team-bkarthik
+spec:
+  source: ns-team-bkarthik
+  
+  metrics:
+    # Namespace-specific container metrics
+    - 'container_cpu_usage_seconds_total{namespace="ns-team-bkarthik"}'
+    - 'container_memory_usage_bytes{namespace="ns-team-bkarthik"}'
+    
+    # Kubernetes state metrics for this namespace
+    - 'kube_pod_status_phase{namespace="ns-team-bkarthik"}'
+    - 'kube_deployment_status_replicas{namespace="ns-team-bkarthik"}'
+    
+    # General cluster metrics that don't have namespace labels
+    - 'up'
+    - 'prometheus_build_info'
+    - 'node_memory_MemAvailable_bytes'
+    - 'kube_node_info'
+    
+    # All pod-related metrics for this namespace
+    - '{namespace="ns-team-bkarthik",__name__=~"kube_pod_.*"}'
+  
+  remoteWrite:
+    enabled: true
+    interval: "30s"
+    target:
+      type: "prometheus"
+    prometheus:
+      serviceName: "prometheus-test"
+      servicePort: 9090
+    extraLabels:
+      tenant: "team-bkarthik"
+      filtering_type: "mixed"
+      managed_by: "multi-tenant-proxy" 

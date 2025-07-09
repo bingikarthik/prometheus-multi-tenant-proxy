@@ -2,50 +2,70 @@
 
 ## Overview
 
-The Prometheus Multi-Tenant Proxy handles remote write by:
-1. Collecting metrics from Infrastructure Prometheus
-2. Sending them to tenant-specific Prometheus instances using the standard `/api/v1/write` endpoint
+The Prometheus Multi-Tenant Proxy implements a **pull-then-push** architecture for remote write functionality:
 
-## Flow Diagram
+1. **Pulls metrics** from infrastructure Prometheus instances based on tenant access rules
+2. **Filters metrics** according to tenant-specific patterns and permissions
+3. **Enriches metrics** with tenant-specific labels
+4. **Pushes metrics** to tenant-specific targets (Prometheus, Pushgateway, or external endpoints)
+
+## Architecture Flow
 
 ```
-┌─────────────────────┐
-│  Infrastructure     │
-│    Prometheus       │
-│                     │
-│  Metrics:           │
-│  - node_cpu_usage   │
-│  - node_memory      │
-│  - container_*      │
-└──────────┬──────────┘
-           │
-           │ Query /api/v1/query
-           │ (Pull metrics)
-           ▼
-┌─────────────────────┐
-│  Multi-Tenant       │
-│     Proxy           │
-│                     │
-│  RemoteWrite        │
-│  Controller         │
-└──────────┬──────────┘
-           │
-           │ POST /api/v1/write
-           │ (Push metrics)
-           ▼
-┌─────────────────────┐
-│  Tenant Prometheus  │
-│  (Core Prometheus)  │
-│                     │
-│  namespace: webapp  │
-│  service: prometheus│
-│  port: 9090        │
-└─────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           Infrastructure Layer                                  │
+│                                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                │
+│  │   Prometheus    │  │   Prometheus    │  │   Prometheus    │                │
+│  │   Instance A    │  │   Instance B    │  │   Instance C    │                │
+│  │  (monitoring)   │  │  (monitoring)   │  │  (monitoring)   │                │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘                │
+│          │                       │                       │                     │
+│          │                       │                       │                     │
+│          └───────────────────────┼───────────────────────┘                     │
+│                                  │                                             │
+│                                  │ Pull metrics via                            │
+│                                  │ /api/v1/query                               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      Multi-Tenant Proxy (monitoring ns)                        │
+│                                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                │
+│  │   Remote Write  │  │   Tenant        │  │   Service       │                │
+│  │   Controller    │  │   Manager       │  │   Discovery     │                │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘                │
+│                                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                │
+│  │   Metrics       │  │   Filtering     │  │   Label         │                │
+│  │   Collector     │  │   Engine        │  │   Enrichment    │                │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   │ Push metrics via
+                                   │ /api/v1/write
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              Tenant Layer                                      │
+│                                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                │
+│  │  Tenant A       │  │  Tenant B       │  │  Tenant C       │                │
+│  │  Namespace      │  │  Namespace      │  │  Namespace      │                │
+│  │                 │  │                 │  │                 │                │
+│  │ ┌─────────────┐ │  │ ┌─────────────┐ │  │ ┌─────────────┐ │                │
+│  │ │ Prometheus  │ │  │ │ Prometheus  │ │  │ │ Pushgateway │ │                │
+│  │ │ (port 9090) │ │  │ │ (port 9090) │ │  │ │ (port 9091) │ │                │
+│  │ └─────────────┘ │  │ └─────────────┘ │  │ └─────────────┘ │                │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘                │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Configuration Example
+## Detailed Flow
 
-When a tenant configures remote write:
+### 1. Configuration and Discovery
+
+When a tenant creates a `MetricAccess` resource with remote write enabled:
 
 ```yaml
 apiVersion: observability.ethos.io/v1alpha1
@@ -54,43 +74,200 @@ metadata:
   name: webapp-metrics
   namespace: webapp-team
 spec:
+  source: webapp-team
   metrics:
     - "http_requests_total"
     - "http_request_duration_seconds"
-  source: webapp-team
+    - '{job="webapp"}'
   
   remoteWrite:
     enabled: true
     interval: "30s"
     target:
       type: "prometheus"
-      prometheus:
-        serviceName: "prometheus"  # Tenant's Prometheus service
-        servicePort: 9090         # Tenant's Prometheus port
+    prometheus:
+      serviceName: "prometheus"
+      servicePort: 9090
+    extraLabels:
+      tenant: "webapp-team"
+      managed_by: "multi-tenant-proxy"
 ```
 
-## What Happens Internally
+### 2. Remote Write Controller Initialization
 
-1. **Metric Collection**: The proxy queries the Infrastructure Prometheus to collect the specified metrics
+The Remote Write Controller:
+- Watches for `MetricAccess` resources with `remoteWrite.enabled: true`
+- Creates a `RemoteWriteJob` for each enabled configuration
+- Starts a goroutine that runs on the specified interval (default: 30s)
 
-2. **URL Construction**: The proxy automatically constructs the remote write URL:
+### 3. Metric Collection Process
+
+For each collection cycle:
+
+1. **Target Discovery**: Gets healthy Prometheus targets from service discovery
+2. **Metric Querying**: For each metric pattern in the `MetricAccess`:
+   ```go
+   // Example queries generated
+   queryPattern := "http_requests_total"
+   queryURL := fmt.Sprintf("%s/api/v1/query?query=%s", targetURL, url.QueryEscape(queryPattern))
    ```
-   http://prometheus.webapp-team.svc.cluster.local:9090/api/v1/write
-   ```
-   
-   Note: `/api/v1/write` is ALWAYS used - it's the standard Prometheus remote write endpoint
+3. **Result Aggregation**: Combines metrics from all healthy targets
+4. **Filtering**: Applies tenant-specific access rules to collected metrics
 
-3. **Remote Write**: The proxy sends the metrics to the tenant's Prometheus using the Prometheus remote write protocol
+### 4. Metric Enrichment
 
-## Why We Removed the Path Configuration
+Before forwarding, metrics are enriched with:
+- **Tenant Labels**: Added from `extraLabels` configuration
+- **Management Labels**: Automatic labels like `managed_by: "multi-tenant-proxy"`
+- **Original Labels**: Preserved from source metrics (if `honorLabels: true`)
 
-- The path is ALWAYS `/api/v1/write` for Prometheus remote write
-- This is a Prometheus standard that cannot be changed
-- Allowing configuration would only introduce potential for errors
-- The proxy handles this automatically, ensuring correct behavior
+### 5. Remote Write Delivery
 
-## Benefits
+Metrics are sent to the target using the appropriate collector:
 
-1. **Simplicity**: Tenants only need to specify their Prometheus service name and port
-2. **Reliability**: No chance of misconfiguration with wrong paths
-3. **Standards Compliance**: Always uses the correct Prometheus remote write endpoint 
+#### Prometheus Target
+- **Endpoint**: `http://<serviceName>.<namespace>.svc.cluster.local:<port>/api/v1/write`
+- **Format**: Prometheus remote write protocol (protobuf + snappy compression)
+- **Headers**: `Content-Type: application/x-protobuf`, `Content-Encoding: snappy`
+
+#### Pushgateway Target
+- **Endpoint**: `http://<serviceName>.<namespace>.svc.cluster.local:<port>/metrics/job/<jobName>`
+- **Format**: Prometheus exposition format
+- **Method**: PUT or POST
+
+#### External Remote Write
+- **Endpoint**: User-specified URL
+- **Authentication**: Basic auth or custom headers
+- **Format**: Prometheus remote write protocol
+
+## Configuration Examples
+
+### Basic Prometheus Remote Write
+```yaml
+remoteWrite:
+  enabled: true
+  interval: "30s"
+  target:
+    type: "prometheus"
+  prometheus:
+    serviceName: "prometheus"
+    servicePort: 9090
+  extraLabels:
+    tenant: "my-team"
+```
+
+### Pushgateway Configuration
+```yaml
+remoteWrite:
+  enabled: true
+  interval: "60s"
+  target:
+    type: "pushgateway"
+  pushgateway:
+    serviceName: "pushgateway"
+    servicePort: 9091
+    jobName: "remote-write-metrics"
+  extraLabels:
+    tenant: "my-team"
+```
+
+### External Remote Write
+```yaml
+remoteWrite:
+  enabled: true
+  interval: "15s"
+  target:
+    type: "remote_write"
+  remoteWrite:
+    url: "https://external-prometheus.example.com/api/v1/write"
+    basicAuth:
+      username: "monitoring-user"
+      passwordSecret:
+        name: "prometheus-auth"
+        key: "password"
+    headers:
+      X-Tenant: "my-team"
+  extraLabels:
+    source_cluster: "production"
+```
+
+## Tenant Prometheus Requirements
+
+For successful remote write to a tenant Prometheus instance:
+
+### 1. Enable Remote Write Receiver
+```yaml
+containers:
+- name: prometheus
+  image: prom/prometheus:v2.45.0
+  args:
+    - '--config.file=/etc/prometheus/prometheus.yml'
+    - '--storage.tsdb.path=/prometheus'
+    - '--web.enable-remote-write-receiver'  # Essential for remote write
+```
+
+### 2. Service Configuration
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus  # Must match serviceName in MetricAccess
+  namespace: tenant-namespace
+spec:
+  ports:
+  - port: 9090      # Must match servicePort in MetricAccess
+    targetPort: 9090
+  selector:
+    app: prometheus
+```
+
+### 3. Network Access
+Ensure the multi-tenant proxy can reach the tenant Prometheus:
+- **Service discovery**: Prometheus service must be discoverable
+- **Network policies**: Allow traffic from monitoring namespace to tenant namespace
+- **Firewall rules**: Ensure port 9090 is accessible
+
+## Monitoring and Troubleshooting
+
+### Metrics
+
+The remote write controller exposes metrics:
+- `remote_write_metrics_collected_total{tenant, target_type}`
+- `remote_write_requests_total{tenant, target_type, status}`
+- `remote_write_request_duration_seconds{tenant, target_type}`
+
+### Logs
+
+Key log messages to monitor:
+```json
+{
+  "level": "info",
+  "msg": "Collected metrics for remote write job",
+  "namespace": "webapp-team",
+  "name": "webapp-metrics",
+  "count": 1250,
+  "targets_used": 3
+}
+```
+
+### Common Issues
+
+1. **No metrics collected**: Check metric patterns and infrastructure Prometheus accessibility
+2. **Remote write failures**: Verify tenant Prometheus has `--web.enable-remote-write-receiver`
+3. **Network connectivity**: Ensure proxy can reach tenant services
+4. **Authentication errors**: Check service account permissions and network policies
+
+### Debug Endpoints
+
+- `GET /collected-metrics` - View latest collected metrics for all tenants
+- `GET /debug/targets` - Check discovered infrastructure Prometheus targets
+- `GET /health` - Overall system health including remote write status
+
+## Best Practices
+
+1. **Interval Configuration**: Balance between data freshness and system load
+2. **Metric Patterns**: Use specific patterns to avoid collecting unnecessary metrics
+3. **Label Management**: Use `extraLabels` for tenant identification and management
+4. **Error Handling**: Monitor remote write failures and set up alerting
+5. **Resource Management**: Consider memory and CPU impact of frequent collections
+6. **Security**: Use network policies to restrict access between namespaces 

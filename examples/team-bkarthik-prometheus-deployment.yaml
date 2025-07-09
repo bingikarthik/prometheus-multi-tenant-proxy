@@ -24,10 +24,7 @@ data:
         cluster: 'test-cluster'
         team: 'bkarthik'
     
-    # Remote write configuration to receive metrics from multi-tenant proxy
-    # This is where the proxy will send metrics
-    remote_write:
-      - url: http://localhost:9090/api/v1/write
+    # No remote write configuration needed - the proxy sends to /api/v1/write automatically
     
     # Scrape configurations
     scrape_configs:
@@ -235,32 +232,29 @@ spec:
   
   # Metrics this team can access from infrastructure Prometheus
   metrics:
-    - "container_cpu_usage_seconds_total"
-    - "container_memory_usage_bytes"
-    - "container_network_receive_bytes_total"
-    - "container_network_transmit_bytes_total"
-    - "kube_pod_status_phase"
-    - "kube_deployment_status_replicas"
-    - "node_cpu_seconds_total"
+    - "up"
+    - "prometheus_build_info"
+    - "prometheus_config_last_reload_successful"
+    - "kube_node_info"
     - "node_memory_MemAvailable_bytes"
-    - '{__name__=~"kube_pod_.*", namespace="ns-team-bkarthik"}'
-    - '{job="kubernetes-pods", namespace="ns-team-bkarthik"}'
-  
-  # Additional label selectors to filter metrics
-  labelSelectors:
-    team: "bkarthik"
+    - 'container_cpu_usage_seconds_total{namespace="ns-team-bkarthik"}'
+    - 'container_memory_usage_bytes{namespace="ns-team-bkarthik"}'
+    - 'kube_pod_status_phase{namespace="ns-team-bkarthik"}'
+    - '{namespace="ns-team-bkarthik",__name__=~"kube_pod_.*"}'
   
   # Remote write configuration to push metrics to team's Prometheus
   remoteWrite:
     enabled: true
     interval: "30s"
+    target:
+      type: "prometheus"
     prometheus:
       serviceName: "prometheus-test"
       servicePort: 9090
     extraLabels:
       tenant: "team-bkarthik"
       environment: "test"
-    honorLabels: true
+      managed_by: "multi-tenant-proxy"
 
 ---
 # Example application deployment for testing

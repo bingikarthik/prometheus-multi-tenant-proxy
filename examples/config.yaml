@@ -11,7 +11,7 @@ discovery:
     
     # Label selectors for discovering Prometheus services
     label_selectors:
-      app: prometheus
+      app.kubernetes.io/name: prometheus
     
     # Optional: Annotation selectors for additional filtering
     annotation_selectors:
@@ -23,7 +23,6 @@ discovery:
     # Resource types to discover
     resource_types:
       - Service
-      - Pod 
   
   # How often to refresh the list of targets
   refresh_interval: 30s
@@ -32,6 +31,9 @@ discovery:
 tenants:
   # Watch all namespaces for MetricAccess resources
   watch_all_namespaces: true
+  
+  # Refresh interval for tenant configuration
+  refresh_interval: 30s
 
 # Remote Write Configuration
 remote_write:
@@ -43,9 +45,15 @@ remote_write:
   
   # Maximum number of concurrent remote write jobs
   max_concurrent_jobs: 10
+  
+  # Timeout for remote write requests
+  timeout: 30s
 
 # Proxy Configuration
 proxy:
+  # Listen address and port
+  listen_address: "0.0.0.0:8080"
+  
   # Enable query result caching
   enable_caching: true
   cache_ttl: 5m
@@ -61,8 +69,38 @@ proxy:
   
   # Timeout for backend requests
   backend_timeout: 30s
+  
+  # Enable tenant filtering
+  enable_tenant_filtering: true
 
-# Authentication is disabled for development
-# Uncomment and configure for production use
-# auth:
-#   type: "none" 
+# Logging Configuration
+logging:
+  level: "info"
+  format: "json"
+  
+# Health Check Configuration
+health:
+  # Enable health check endpoint
+  enabled: true
+  
+  # Health check endpoint path
+  path: "/health"
+
+# Metrics Configuration
+metrics:
+  # Enable metrics endpoint
+  enabled: true
+  
+  # Metrics endpoint path
+  path: "/metrics"
+  
+  # Metrics namespace
+  namespace: "prometheus_multi_tenant_proxy"
+
+# Authentication Configuration
+# Note: Authentication is disabled for development
+# Enable and configure for production use
+auth:
+  enabled: false
+  # type: "header"  # or "jwt", "basic"
+  # header_name: "X-Tenant-Namespace" 
