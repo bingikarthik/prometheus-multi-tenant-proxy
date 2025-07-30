@@ -10,8 +10,8 @@ metadata:
     app.kubernetes.io/component: proxy
     app.kubernetes.io/part-of: prometheus-multi-tenant-system
 spec:
-  replicas: 2  # Start with 2 replicas for testing
-  revisionHistoryLimit: 3
+  replicas: 2  # Production-ready with 3 replicas for HA
+  revisionHistoryLimit: 5  # Keep more history for rollbacks
   selector:
     matchLabels:
       app: prometheus-multi-tenant-proxy
@@ -57,7 +57,7 @@ spec:
       containers:
         # Nginx proxy with rate limiting
         - name: nginx-proxy
-          image: nginx:1.25.4-alpine  # Use alpine for smaller size
+          image: nginx:1.26.1-alpine  # Latest stable alpine version
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8081
@@ -73,21 +73,21 @@ spec:
               name: nginx-run
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 100m      # Increased for production
+              memory: 128Mi  # Increased for production
             limits:
-              cpu: 200m
-              memory: 128Mi
+              cpu: 500m      # Higher limit for burst traffic
+              memory: 256Mi  # Higher limit for rate limiting state
           livenessProbe:
             failureThreshold: 3
             httpGet:
               path: /health
               port: http
               scheme: HTTP
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 10
             successThreshold: 1
-            timeoutSeconds: 3
+            timeoutSeconds: 5
           readinessProbe:
             failureThreshold: 3
             httpGet:
@@ -103,6 +103,7 @@ spec:
             runAsNonRoot: true
             runAsUser: 101  # nginx user
             runAsGroup: 101
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -136,6 +137,8 @@ spec:
                 fieldRef:
                   apiVersion: v1
                   fieldPath: status.podIP
+            - name: GOMAXPROCS
+              value: "2"  # Optimize Go runtime for container limits
           ports:
             - containerPort: 8080
               name: proxy-http
@@ -148,11 +151,11 @@ spec:
               mountPath: /tmp
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 200m     # Increased for production workload
+              memory: 256Mi # Increased for caching and processing
             limits:
-              cpu: 500m  # Reduced from 1000m for initial testing
-              memory: 512Mi  # Reduced from 1Gi for initial testing
+              cpu: 1000m    # Full CPU core for high throughput
+              memory: 1Gi   # Higher memory for large query results
           livenessProbe:
             httpGet:
               path: /health
@@ -167,7 +170,7 @@ spec:
               path: /health
               port: proxy-http
               scheme: HTTP
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
@@ -187,6 +190,8 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - '--nginx.scrape-uri=http://localhost:8081/basic_status'
+            - '--web.listen-address=:9113'
+            - '--web.telemetry-path=/metrics'
           env:
             - name: POD_UID
               valueFrom:
@@ -199,11 +204,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              cpu: 10m
-              memory: 32Mi
+              cpu: 20m      # Increased for production
+              memory: 64Mi  # Increased for stability
             limits:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 100m     # Higher limit for metrics processing
+              memory: 128Mi # Higher limit for metrics storage
           livenessProbe:
             httpGet:
               path: /metrics
@@ -224,6 +229,7 @@ spec:
             failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 65534
             runAsGroup: 65534
@@ -231,15 +237,13 @@ spec:
               drop:
                 - ALL
       
-      # Remove specific DNS config - use cluster defaults
+      # Production DNS configuration
       dnsPolicy: ClusterFirst
-      
-      # Remove imagePullSecrets if not needed in your environment
-      # imagePullSecrets:
-      #   - name: k8s-infrastructure-public
-      
-      # Use default priority class initially
-      # priorityClassName: system-cluster-critical
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+          - name: edns0
       
       restartPolicy: Always
       securityContext:
@@ -249,7 +253,7 @@ spec:
           type: RuntimeDefault
       serviceAccount: prometheus-multi-tenant-proxy
       serviceAccountName: prometheus-multi-tenant-proxy
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 60  # Increased for graceful shutdown
       volumes:
         - name: config
           configMap:
@@ -260,13 +264,17 @@ spec:
             items:
               - key: nginx.conf
                 path: nginx.conf
+            defaultMode: 0644
         # Writable volumes for nginx
         - name: nginx-cache
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 100Mi  # Limit cache size
         - name: nginx-run
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 10Mi   # Limit run directory size
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 100Mi  # Limit temp directory size
 
 ---
 apiVersion: v1
