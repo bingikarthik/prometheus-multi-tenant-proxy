@@ -37,6 +37,7 @@ var (
 	leaderElect                 = flag.Bool("leader-elect", true, "Enable leader election for the remote write controller. Must be true when running multiple replicas to avoid duplicate writes.")
 	leaderElectionID            = flag.String("leader-election-id", "prometheus-multi-tenant-proxy-remote-write", "Name of the Lease object used for leader election")
 	leaderElectionNamespace     = flag.String("leader-election-namespace", "", "Namespace for the leader election Lease (defaults to POD_NAMESPACE env var, then 'monitoring')")
+	selfHealPodRestart          = flag.Bool("self-heal-pod-restart", true, "Enable the last-resort self-heal pod restart (US-005): when in-process recreate keeps failing, the remote-write leader restarts its own pod via a non-zero exit. Ships enabled; set false to disable.")
 )
 
 func main() {
@@ -57,6 +58,16 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to load configuration: %v", err)
 	}
+
+	// Wire the US-005 pod-restart self-heal flag into config. The flag overrides
+	// the config-file value only when explicitly provided on the command line;
+	// otherwise the config value (defaulted to enabled by setDefaults) stands.
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "self-heal-pod-restart" {
+			v := *selfHealPodRestart
+			cfg.RemoteWrite.SelfHealPodRestart = &v
+		}
+	})
 
 	// Setup Kubernetes client
 	k8sConfig, err := getKubernetesConfig(*kubeconfig)

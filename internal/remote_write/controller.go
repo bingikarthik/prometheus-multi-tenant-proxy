@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,31 @@ type Controller struct {
 	// and is overridden in tests to make stall detection deterministic without
 	// real sleeps.
 	now func() time.Time
+
+	// exit is an injectable process-exit seam used by the US-005 last-resort
+	// self-heal to restart the pod. It defaults to os.Exit in NewController and
+	// is overridden in tests to record the code instead of terminating the test
+	// process.
+	exit func(int)
+
+	// isLeader records that this controller is running as the remote-write
+	// leader. It is set true by reconcileLoop, which main.go starts ONLY from
+	// the leader-election OnStartedLeading callback — so reaching the self-heal
+	// pod restart (US-005) is structurally leader-only. This field is an
+	// explicit, testable second gate on the escalation and MUST NOT be used to
+	// weaken that structural guarantee. Guarded by mu.
+	isLeader bool
+
+	// Self-heal pod-restart escalation state (US-005, ETHOS-115242). Guarded by
+	// mu.
+	//
+	// lastSelfRestartAt is the controller-clock time of the last self-restart
+	// attempt; the zero value means never. It throttles the escalation to at
+	// most one attempt per podRestartCooldown.
+	lastSelfRestartAt time.Time
+	// selfRestartTotal counts last-resort self-restart escalations triggered by
+	// the watchdog. US-006 will export this as a metric.
+	selfRestartTotal int64
 }
 
 // defaultStallGracePeriod is used when RemoteWriteConfig.StallGracePeriod is
@@ -64,6 +90,14 @@ const defaultStallGracePeriod = 15 * time.Minute
 // defaultRecreateBackoff is used when RemoteWriteConfig.RecreateBackoff is unset
 // or non-positive.
 const defaultRecreateBackoff = 5 * time.Minute
+
+// defaultPodRestartGracePeriod is used when
+// RemoteWriteConfig.PodRestartGracePeriod is unset or non-positive (US-005).
+const defaultPodRestartGracePeriod = 45 * time.Minute
+
+// defaultPodRestartCooldown is used when RemoteWriteConfig.PodRestartCooldown is
+// unset or non-positive (US-005).
+const defaultPodRestartCooldown = 30 * time.Minute
 
 // RemoteWriteJob represents a remote write job for a tenant
 type RemoteWriteJob struct {
@@ -120,6 +154,7 @@ func NewController(client client.Client, cfg config.RemoteWriteConfig, serviceDi
 		stopCh:           make(chan struct{}),
 		doneCh:           make(chan struct{}),
 		now:              time.Now,
+		exit:             os.Exit,
 	}
 }
 
@@ -140,6 +175,37 @@ func (c *Controller) recreateBackoff() time.Duration {
 		return c.config.RecreateBackoff
 	}
 	return defaultRecreateBackoff
+}
+
+// podRestartGracePeriod returns the configured US-005 pod-restart grace period,
+// falling back to defaultPodRestartGracePeriod when unset. Mirrors
+// stallGracePeriod/recreateBackoff.
+func (c *Controller) podRestartGracePeriod() time.Duration {
+	if c.config.PodRestartGracePeriod > 0 {
+		return c.config.PodRestartGracePeriod
+	}
+	return defaultPodRestartGracePeriod
+}
+
+// podRestartCooldown returns the configured US-005 pod-restart cooldown, falling
+// back to defaultPodRestartCooldown when unset.
+func (c *Controller) podRestartCooldown() time.Duration {
+	if c.config.PodRestartCooldown > 0 {
+		return c.config.PodRestartCooldown
+	}
+	return defaultPodRestartCooldown
+}
+
+// selfHealPodRestartEnabled reports whether the US-005 last-resort pod restart
+// is enabled. It ships ENABLED: a nil (unset) config value is treated as true.
+// setDefaults and the --self-heal-pod-restart flag normally populate this; the
+// nil-guard keeps the feature on for controllers constructed directly (e.g.
+// tests) without extra wiring.
+func (c *Controller) selfHealPodRestartEnabled() bool {
+	if c.config.SelfHealPodRestart == nil {
+		return true
+	}
+	return *c.config.SelfHealPodRestart
 }
 
 // isJobStalled reports whether an enabled collection job has gone without a
@@ -206,7 +272,18 @@ func (c *Controller) Stop() {
 // reconcileLoop periodically reconciles remote write jobs
 func (c *Controller) reconcileLoop(ctx context.Context) {
 	defer close(c.doneCh)
-	
+
+	// LEADER-ONLY marker (US-005): reconcileLoop is started by Controller.Start,
+	// which cmd/proxy/main.go invokes ONLY from the leader-election
+	// OnStartedLeading callback (and, with leader election disabled, only for the
+	// single active replica). Reaching this code therefore means this replica is
+	// the remote-write leader, so the self-heal pod restart performed from
+	// evaluateSelfHeal is structurally leader-only. Record it as an explicit,
+	// testable gate on that escalation.
+	c.mu.Lock()
+	c.isLeader = true
+	c.mu.Unlock()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	
@@ -371,12 +448,41 @@ func (c *Controller) stopAllJobs() {
 	}
 }
 
-// evaluateSelfHeal is the first self-heal action (US-004, ETHOS-115242). It is
-// the watchdog step invoked from the reconcile tick: for each stalled job it
-// stops the in-process collection job and recreates it with fresh target
-// resolution, before any pod restart (which is US-005). Recreation is
-// rate-limited per job by recreateBackoff, and throttle bookkeeping
-// (lastRecreateAt/recreateCount) is carried forward onto the fresh job struct.
+// shouldEscalatePodRestart reports whether a stalled job qualifies for the
+// US-005 last-resort pod restart: the feature is enabled, this replica is the
+// leader, in-process recreate has already been attempted (recreateCount >= 1),
+// and the job has remained stalled beyond podRestartGracePeriod. It does NOT
+// apply the cooldown throttle — that stays with the caller so lastSelfRestartAt
+// is only advanced when a restart actually fires. Callers must hold c.mu.
+func (c *Controller) shouldEscalatePodRestart(job *RemoteWriteJob, stallDuration time.Duration) bool {
+	if !c.selfHealPodRestartEnabled() {
+		return false
+	}
+	if !c.isLeader {
+		return false
+	}
+	if job.recreateCount < 1 {
+		return false
+	}
+	return stallDuration > c.podRestartGracePeriod()
+}
+
+// evaluateSelfHeal runs the self-heal watchdog from the reconcile tick
+// (ETHOS-115242). For each stalled job it applies a two-step escalation:
+//
+//	Step 1 (US-004): stop the in-process collection job and recreate it with
+//	fresh target resolution, rate-limited per job by recreateBackoff. Throttle
+//	bookkeeping (lastRecreateAt/recreateCount) is carried forward onto the fresh
+//	job struct.
+//
+//	Step 2 (US-005, LAST RESORT): if in-process recreate has already been
+//	attempted (recreateCount >= 1) and the job is STILL stalled beyond
+//	podRestartGracePeriod, restart the pod by exiting the process with a
+//	non-zero code. Escalation is checked BEFORE recreate so a job that recreate
+//	could not fix is restarted rather than recreated yet again
+//	(escalate-only-after-recreate-failed). It is leader-only (c.isLeader) and
+//	gated by the --self-heal-pod-restart flag, and throttled to at most one
+//	attempt per podRestartCooldown via lastSelfRestartAt.
 //
 // It holds c.mu for the whole sweep, consistent with reconcileRemoteWriteJobs,
 // and uses isJobStalledLocked to avoid re-entering the RWMutex.
@@ -399,18 +505,45 @@ func (c *Controller) evaluateSelfHeal(ctx context.Context, now time.Time) {
 			continue
 		}
 
-		// Rate limit: recreate a given job at most once per recreateBackoff.
-		if !job.lastRecreateAt.IsZero() && now.Sub(job.lastRecreateAt) < c.recreateBackoff() {
-			continue
-		}
-
-		// Stall duration for logging: measured from the same baseline used to
-		// classify the stall (last success, else creation time).
+		// Stall duration: measured from the same baseline used to classify the
+		// stall (last success, else creation time). Used by both the US-005
+		// escalation gate below and US-004 recreate logging.
 		baseline := job.lastSuccessfulCollectionTime
 		if baseline.IsZero() {
 			baseline = job.createdAt
 		}
 		stallDuration := now.Sub(baseline)
+
+		// Step 2 (US-005): LAST-RESORT pod restart. Checked before recreate.
+		if c.shouldEscalatePodRestart(job, stallDuration) {
+			// Throttle: at most one self-restart per podRestartCooldown.
+			if c.lastSelfRestartAt.IsZero() || now.Sub(c.lastSelfRestartAt) >= c.podRestartCooldown() {
+				c.lastSelfRestartAt = now
+				c.selfRestartTotal++
+				logrus.WithFields(logrus.Fields{
+					"tenant_key":     key,
+					"stall_duration": stallDuration.String(),
+					"recreate_count": job.recreateCount,
+				}).Warn("US-005 self-heal: in-process recreate exhausted; restarting pod via non-zero exit (last resort)")
+
+				// Trigger the pod restart. In production c.exit is os.Exit and
+				// does not return, so nothing below runs. In tests the injected
+				// seam records the code and DOES return; return immediately so we
+				// do not fall through to recreate or process further jobs. The
+				// deferred c.mu.Unlock still runs on return.
+				c.exit(1)
+				return
+			}
+			// Within cooldown: an escalation already happened recently. Do not
+			// exit again and do not recreate this job — wait out the cooldown.
+			continue
+		}
+
+		// Step 1 (US-004): rate limit — recreate a given job at most once per
+		// recreateBackoff.
+		if !job.lastRecreateAt.IsZero() && now.Sub(job.lastRecreateAt) < c.recreateBackoff() {
+			continue
+		}
 
 		// Carry throttle bookkeeping forward across the stop/recreate: the new
 		// job is a fresh struct, so capture the counters before stopping.
