@@ -141,6 +141,17 @@ type RemoteWriteJob struct {
 	// been recreated by the watchdog. It is carried forward across recreates and
 	// is intentionally NOT reset on a successful collection.
 	recreateCount int
+
+	// stalledSince is the controller-clock time this logical job was first
+	// observed continuously stalled (US-005, ETHOS-115242). Unlike createdAt —
+	// which US-004 resets on every recreate — stalledSince PERSISTS ACROSS
+	// RECREATES (carried forward onto the fresh job struct alongside
+	// recreateCount) and is cleared only by a genuinely successful collection.
+	// It is therefore the correct baseline for the pod-restart escalation window:
+	// it measures how long the job has stayed wedged despite repeated in-process
+	// recreates. Zero means the job is not currently known to be stalled.
+	// Guarded by Controller.mu.
+	stalledSince time.Time
 }
 
 // NewController creates a new remote write controller
@@ -451,10 +462,14 @@ func (c *Controller) stopAllJobs() {
 // shouldEscalatePodRestart reports whether a stalled job qualifies for the
 // US-005 last-resort pod restart: the feature is enabled, this replica is the
 // leader, in-process recreate has already been attempted (recreateCount >= 1),
-// and the job has remained stalled beyond podRestartGracePeriod. It does NOT
-// apply the cooldown throttle — that stays with the caller so lastSelfRestartAt
-// is only advanced when a restart actually fires. Callers must hold c.mu.
-func (c *Controller) shouldEscalatePodRestart(job *RemoteWriteJob, stallDuration time.Duration) bool {
+// and the job has been CONTINUOUSLY stalled (stalledSince) beyond
+// podRestartGracePeriod. The window is measured from stalledSince — which
+// survives recreates — rather than per-job createdAt, so a job that recreate
+// keeps failing to fix actually reaches the threshold in normal operation. It
+// does NOT apply the cooldown throttle — that stays with the caller so
+// lastSelfRestartAt is only advanced when a restart actually fires. Callers must
+// hold c.mu.
+func (c *Controller) shouldEscalatePodRestart(job *RemoteWriteJob, now time.Time) bool {
 	if !c.selfHealPodRestartEnabled() {
 		return false
 	}
@@ -464,7 +479,10 @@ func (c *Controller) shouldEscalatePodRestart(job *RemoteWriteJob, stallDuration
 	if job.recreateCount < 1 {
 		return false
 	}
-	return stallDuration > c.podRestartGracePeriod()
+	if job.stalledSince.IsZero() {
+		return false
+	}
+	return now.Sub(job.stalledSince) > c.podRestartGracePeriod()
 }
 
 // evaluateSelfHeal runs the self-heal watchdog from the reconcile tick
@@ -505,9 +523,18 @@ func (c *Controller) evaluateSelfHeal(ctx context.Context, now time.Time) {
 			continue
 		}
 
-		// Stall duration: measured from the same baseline used to classify the
-		// stall (last success, else creation time). Used by both the US-005
-		// escalation gate below and US-004 recreate logging.
+		// US-005: record the first moment this job was observed continuously
+		// stalled. Every job in stalledKeys is stalled right now, so seed
+		// stalledSince if unset. It PERSISTS across recreates (carried forward
+		// below) and clears only on a successful collection, so it — not the
+		// recreate-resetting createdAt — is the escalation window baseline.
+		if job.stalledSince.IsZero() {
+			job.stalledSince = now
+		}
+
+		// Stall duration: measured from the per-job baseline (last success, else
+		// creation time). This resets on recreate and is used only for US-004
+		// recreate logging; the escalation window uses stalledSince.
 		baseline := job.lastSuccessfulCollectionTime
 		if baseline.IsZero() {
 			baseline = job.createdAt
@@ -515,14 +542,14 @@ func (c *Controller) evaluateSelfHeal(ctx context.Context, now time.Time) {
 		stallDuration := now.Sub(baseline)
 
 		// Step 2 (US-005): LAST-RESORT pod restart. Checked before recreate.
-		if c.shouldEscalatePodRestart(job, stallDuration) {
+		if c.shouldEscalatePodRestart(job, now) {
 			// Throttle: at most one self-restart per podRestartCooldown.
 			if c.lastSelfRestartAt.IsZero() || now.Sub(c.lastSelfRestartAt) >= c.podRestartCooldown() {
 				c.lastSelfRestartAt = now
 				c.selfRestartTotal++
 				logrus.WithFields(logrus.Fields{
 					"tenant_key":     key,
-					"stall_duration": stallDuration.String(),
+					"stall_duration": now.Sub(job.stalledSince).String(),
 					"recreate_count": job.recreateCount,
 				}).Warn("US-005 self-heal: in-process recreate exhausted; restarting pod via non-zero exit (last resort)")
 
@@ -546,9 +573,12 @@ func (c *Controller) evaluateSelfHeal(ctx context.Context, now time.Time) {
 		}
 
 		// Carry throttle bookkeeping forward across the stop/recreate: the new
-		// job is a fresh struct, so capture the counters before stopping.
+		// job is a fresh struct, so capture the counters before stopping. The
+		// continuous-stall baseline (stalledSince) is carried forward too so the
+		// US-005 escalation window is NOT reset by an in-process recreate.
 		metricAccess := job.MetricAccess
 		nextRecreateCount := job.recreateCount + 1
+		carriedStalledSince := job.stalledSince
 
 		c.stopRemoteWriteJobLocked(key, job)
 		if err := c.createRemoteWriteJobLocked(ctx, metricAccess); err != nil {
@@ -564,6 +594,7 @@ func (c *Controller) evaluateSelfHeal(ctx context.Context, now time.Time) {
 		newJob := c.jobs[key]
 		newJob.lastRecreateAt = now
 		newJob.recreateCount = nextRecreateCount
+		newJob.stalledSince = carriedStalledSince
 
 		logrus.WithFields(logrus.Fields{
 			"tenant_key":     key,
@@ -838,6 +869,9 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 		// stall is handled fresh. recreateCount is a lifetime counter and is
 		// intentionally left intact.
 		job.lastRecreateAt = time.Time{}
+		// US-005: a genuine success ends the continuous-stall window, so clear
+		// the escalation baseline. A future stall starts a fresh window.
+		job.stalledSince = time.Time{}
 		c.mu.Unlock()
 	} else {
 		// Healthy targets were queried but returned zero series: a silent empty

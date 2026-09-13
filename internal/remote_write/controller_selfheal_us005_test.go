@@ -61,14 +61,16 @@ func newRestartTestController(t *testing.T, at time.Time) (*Controller, *exitRec
 	return c, rec
 }
 
-// stalledRecreatedJob is a job that never succeeded, was created long before now
-// (so it is stalled beyond podRestartGracePeriod) and has already been recreated
-// at least once.
+// stalledRecreatedJob is a job that never succeeded, has been continuously
+// stalled since createdAt (stalledSince == createdAt) and has already been
+// recreated recreateCount times. The escalation window is measured from
+// stalledSince, so tests that drive evaluateSelfHeal directly set it in the past.
 func stalledRecreatedJob(name string, createdAt time.Time, recreateCount int) *RemoteWriteJob {
 	return &RemoteWriteJob{
 		MetricAccess:  newMetricAccess("tenant-a", name),
 		StopCh:        make(chan struct{}),
 		createdAt:     createdAt,
+		stalledSince:  createdAt,
 		recreateCount: recreateCount,
 	}
 }
@@ -245,5 +247,67 @@ func TestNewController_SetsExitSeam(t *testing.T) {
 	c := newTestController(t, &fakeDiscovery{})
 	if c.exit == nil {
 		t.Fatalf("expected NewController to install a non-nil exit seam (os.Exit)")
+	}
+}
+
+// REACHABILITY regression (the key correctness test): with realistic config the
+// escalation must actually fire through the NORMAL watchdog cycle — not only when
+// job state is set directly. US-004's recreate resets per-job createdAt every
+// ~stallGracePeriod, so the escalation window is tracked by a PERSISTENT
+// stalledSince that survives recreates and clears only on a real success. Here a
+// brand-new job never succeeds; the watchdog recreates it repeatedly (~every
+// 15m) and must escalate exactly once after >45m of continuous stall.
+func TestSelfHeal_PodRestart_ReachableAcrossRecreates_NormalCycle(t *testing.T) {
+	t0 := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	c := newTestController(t, offlineDiscovery(t0))
+	c.config.StallGracePeriod = 15 * time.Minute
+	c.config.RecreateBackoff = 5 * time.Minute
+	c.config.PodRestartGracePeriod = 45 * time.Minute
+	c.config.PodRestartCooldown = 30 * time.Minute
+	c.isLeader = true
+	rec := &exitRecorder{}
+	c.exit = rec.record
+
+	now := t0
+	c.now = func() time.Time { return now }
+	defer c.stopAllJobs()
+
+	// A brand-new job created at t0 that will never succeed (offline discovery).
+	// No escalation state is pre-set — it must accrue through the normal cycle.
+	key := "tenant-a/ma-wedged"
+	c.mu.Lock()
+	c.jobs[key] = &RemoteWriteJob{
+		MetricAccess: newMetricAccess("tenant-a", "ma-wedged"),
+		StopCh:       make(chan struct{}),
+		createdAt:    t0,
+	}
+	c.mu.Unlock()
+
+	// Drive the reconcile watchdog once per minute, advancing the clock, until it
+	// escalates (or 3h elapses as a safety bound).
+	fired := false
+	for i := 1; i <= 180; i++ {
+		now = t0.Add(time.Duration(i) * time.Minute)
+		c.evaluateSelfHeal(context.Background(), now)
+		if len(rec.codes) > 0 {
+			fired = true
+			break
+		}
+	}
+
+	if !fired || len(rec.codes) != 1 {
+		t.Fatalf("expected escalation to fire exactly once through the normal recreate cycle, got %d exits (%v)", len(rec.codes), rec.codes)
+	}
+	if c.selfRestartTotal != 1 {
+		t.Fatalf("expected selfRestartTotal==1, got %d", c.selfRestartTotal)
+	}
+	// It must have escalated only after multiple in-process recreates...
+	if got := c.GetActiveJobs()[key]; got == nil || got.recreateCount < 2 {
+		t.Fatalf("expected multiple recreates before escalation, recreateCount=%v", got)
+	}
+	// ...and only after >45m of continuous stall.
+	if elapsed := now.Sub(t0); elapsed <= 45*time.Minute {
+		t.Fatalf("escalation fired after only %v of continuous stall (want > 45m)", elapsed)
 	}
 }
