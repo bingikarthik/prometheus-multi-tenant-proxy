@@ -1351,21 +1351,31 @@ func (c *Controller) sendMetrics(job *RemoteWriteJob, metrics []Metric) error {
 	return nil
 }
 
-// updateJobStatus updates the status of a remote write job
+// updateJobStatus updates the status of a remote write job.
+//
+// It mutates job.MetricAccess.Status, which the self-heal watchdog reads via
+// MetricAccess.DeepCopy() (createRemoteWriteJobLocked) while holding c.mu. A
+// just-stopped job's goroutine can still be finishing a collection cycle when
+// evaluateSelfHeal recreates the job, so this write MUST be serialized under
+// c.mu to avoid a data race with that DeepCopy (ETHOS-115242). Callers invoke
+// this without holding c.mu.
 func (c *Controller) updateJobStatus(job *RemoteWriteJob) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Update the MetricAccess status
 	status := &v1alpha1.RemoteWriteStatus{
 		Active:           true,
 		LastCollection:   metav1.NewTime(job.LastRun),
 		MetricsCollected: int32(job.MetricsCount),
 	}
-	
+
 	if job.LastError != nil {
 		status.LastError = job.LastError.Error()
 	}
-	
+
 	job.MetricAccess.Status.RemoteWrite = status
-	
+
 	// TODO: Update the status in Kubernetes
 	// This would require using the client to patch the MetricAccess resource
 }
