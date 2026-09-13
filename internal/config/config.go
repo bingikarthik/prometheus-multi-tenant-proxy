@@ -108,6 +108,37 @@ type RemoteWriteConfig struct {
 	// MetricAccess CR. Batching is always active; the only tunable is the
 	// chunk size. Unset or zero values default to 5000.
 	BatchSize int `yaml:"batch_size"`
+
+	// StallGracePeriod is how long a per-tenant collection job may go without a
+	// successful collection (>=1 series stored AND remote-write send succeeded)
+	// before it is classified as stalled. A job that has never succeeded is
+	// judged against its creation time. Unset or zero values default to 15m.
+	StallGracePeriod time.Duration `yaml:"stall_grace_period"`
+
+	// RecreateBackoff is the minimum interval between successive in-process
+	// recreations of the same stalled collection job by the self-heal watchdog
+	// (US-004). A given job is recreated at most once per this window, preventing
+	// a persistently unhealthy target from causing tight recreate churn. Unset or
+	// zero values default to 5m.
+	RecreateBackoff time.Duration `yaml:"recreate_backoff"`
+
+	// PodRestartGracePeriod is how long a per-tenant collection job may remain
+	// stalled AFTER at least one in-process recreate attempt (US-004) before the
+	// self-heal watchdog escalates to a LAST-RESORT pod restart (US-005). Unset
+	// or zero values default to 45m.
+	PodRestartGracePeriod time.Duration `yaml:"pod_restart_grace_period"`
+
+	// PodRestartCooldown is the minimum interval between successive self-heal pod
+	// restarts (US-005). At most one self-restart is attempted per this window,
+	// preventing a crash-restart loop. Unset or zero values default to 30m.
+	PodRestartCooldown time.Duration `yaml:"pod_restart_cooldown"`
+
+	// SelfHealPodRestart enables the last-resort self-heal pod restart (US-005).
+	// It ships ENABLED by default: a nil value is treated as true by setDefaults
+	// (and by the controller accessor). Set it to false, or pass
+	// --self-heal-pod-restart=false, to disable the escalation while leaving the
+	// in-process recreate (US-004) active.
+	SelfHealPodRestart *bool `yaml:"self_heal_pod_restart,omitempty"`
 }
 
 // AuthConfig holds authentication settings (optional)
@@ -226,7 +257,29 @@ func setDefaults(config *Config) error {
 	if config.RemoteWrite.BatchSize <= 0 {
 		config.RemoteWrite.BatchSize = 5000
 	}
-	
+
+	if config.RemoteWrite.StallGracePeriod <= 0 {
+		config.RemoteWrite.StallGracePeriod = 15 * time.Minute
+	}
+
+	if config.RemoteWrite.RecreateBackoff <= 0 {
+		config.RemoteWrite.RecreateBackoff = 5 * time.Minute
+	}
+
+	if config.RemoteWrite.PodRestartGracePeriod <= 0 {
+		config.RemoteWrite.PodRestartGracePeriod = 45 * time.Minute
+	}
+
+	if config.RemoteWrite.PodRestartCooldown <= 0 {
+		config.RemoteWrite.PodRestartCooldown = 30 * time.Minute
+	}
+
+	// SelfHealPodRestart ships enabled: a nil (unset) value defaults to true.
+	if config.RemoteWrite.SelfHealPodRestart == nil {
+		enabled := true
+		config.RemoteWrite.SelfHealPodRestart = &enabled
+	}
+
 	// Auth defaults
 	if config.Auth != nil && config.Auth.APIKey != nil && config.Auth.APIKey.HeaderName == "" {
 		config.Auth.APIKey.HeaderName = "X-API-Key"
