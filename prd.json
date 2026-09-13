@@ -96,8 +96,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 6,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "HealthCollector (internal/remote_write/metrics.go) reads live c.jobs under RLock each scrape -> no stale cardinality; registered in main.go, served on existing /metrics (gated by cfg.Proxy.EnableMetrics). Metrics: proxy_tenant_collection_up, _last_successful_collection_timestamp_seconds, _collected_series, _stall_recreations_total (per-tenant), proxy_self_restart_total (proxy-wide, no tenant label - deviation from AC name proxy_tenant_self_restart_total, justified). New job.lastCollectionSucceeded field. testutil.CollectAndCompare tests. US-007 uses proxy_tenant_collection_up==0; ensure EnableMetrics=true in deploy."
     },
     {
       "id": "US-007",
