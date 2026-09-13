@@ -1,0 +1,134 @@
+{
+  "project": "prometheus-multi-tenant-proxy",
+  "branchName": "ralph/tee-v2-proxy-collection-self-heal",
+  "description": "TEE-V2 prometheus-multi-tenant-proxy (ETHOS-115242): stop silent per-tenant collection stalls. Verify the HEAD reconcile fix under repro, harden runtime reconcile-on-add, add a self-heal watchdog (recreate in-process job, then restart pod as last resort), expose per-tenant collection-health metrics, and ship a fleet-wide silent-stall alert.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Reproduce and characterize the wedge against the HEAD image",
+      "description": "As an engineer, I want a repeatable test-harness reproduction of the silent per-tenant collection stall so I can confirm which failure modes HEAD already fixes and scope the remaining hardening.",
+      "acceptanceCriteria": [
+        "A test (envtest / fake controller-runtime client.Client) starts the remote-write Controller, then creates a MetricAccess CR with spec.remoteWrite.enabled=true AFTER Start() has run",
+        "Test asserts whether the HEAD reconcileLoop creates a collection job for the runtime-added CR within one reconcile interval (documents actual behavior as a passing/failing assertion)",
+        "A second scenario mutates the discovered target set (backend pod-IP churn) after job creation and asserts whether collectMetrics recovers via dynamic target resolution",
+        "Findings recorded in a short note (residual gaps where a job is running but collects zero series with no error, e.g. the healthyTargets==0 empty-success branch)",
+        "Tests pass (go test ./...)",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Guarantee runtime reconcile-on-add of remote-write collection jobs",
+      "description": "As a tenant, I want my metrics collected within one reconcile interval of my MetricAccess CR being created, even though the proxy was already running.",
+      "acceptanceCriteria": [
+        "With the Controller already started, creating a MetricAccess (remoteWrite.enabled=true) results in a collection job within <= one reconcile interval (<=30s)",
+        "Enabling remoteWrite on an existing CR, or changing its metric set, is reconciled (job created or restarted via hasConfigurationChanged)",
+        "Deleting or disabling the CR stops and removes the job with no goroutine leak (StopCh closed, job removed from map)",
+        "Regression test covers create-after-start, enable-after-start, and delete/disable",
+        "Tests pass (go test ./...)",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Detect a silent per-tenant collection stall",
+      "description": "As an operator, I want the proxy to track per-job collection health so a tenant with an enabled CR producing zero collected series is classified as stalled.",
+      "acceptanceCriteria": [
+        "RemoteWriteJob tracks lastSuccessfulCollectionTime and lastCollectedSeriesCount, where success = >=1 series stored AND remote-write send returned no error",
+        "collectMetrics no longer treats an empty result (healthyTargets==0 or zero series) as success; it records a failed/empty cycle and increments a stall counter",
+        "A job is classified stalled when: CR enabled AND no successful collection for > stallGracePeriod (default 15m, configurable)",
+        "Unit test drives a job to the stalled state and asserts detection",
+        "Tests pass (go test ./...)",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Self-heal step 1 - auto-recreate the in-process collection job",
+      "description": "As an operator, I want a stalled collection job rebuilt in-process automatically before any pod restart.",
+      "acceptanceCriteria": [
+        "When a job is stalled for > stallGracePeriod, the watchdog stops it (stopRemoteWriteJobLocked) and recreates it (createRemoteWriteJobLocked) with fresh target resolution",
+        "Recreation is rate-limited by recreateBackoff (default 5m) to avoid thrash",
+        "A subsequent successful collection resets stall state and counters",
+        "Each recreate is logged with tenant key, stall duration, and attempt count",
+        "Test: a job stuck at zero series is auto-recreated and recovers once targets return data, with no manual action",
+        "Tests pass (go test ./...)",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Self-heal step 2 - pod restart as last resort",
+      "description": "As an operator, I want the pod to restart itself only if in-process recovery fails, so a truly wedged process still recovers unattended.",
+      "acceptanceCriteria": [
+        "If a job stays stalled for > podRestartGracePeriod (default 45m) despite >=1 recreate attempt and self-restart is enabled, the proxy triggers its own restart (non-zero process exit)",
+        "Restart is leader-only (only the remote-write leader may self-restart) and is disabled when --self-heal-pod-restart=false; escalation ships enabled by default",
+        "Escalation is throttled by podRestartCooldown (default 30m) and emits a WARN log plus increments a restart counter before exiting",
+        "Test covers: escalate-only-after-recreate-failed, leader-only, and throttle",
+        "Tests pass (go test ./...)",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Expose per-tenant collection-health metrics",
+      "description": "As an operator, I want first-class proxy metrics for collection health so alerting does not depend on interpreting the ambiguous up skeleton series.",
+      "acceptanceCriteria": [
+        "Proxy exposes on its metrics endpoint, labeled by tenant namespace and name: proxy_tenant_collection_up, proxy_tenant_last_successful_collection_timestamp_seconds, proxy_tenant_collected_series, proxy_tenant_stall_recreations_total, proxy_tenant_self_restart_total",
+        "Metrics are emitted only for tenants with an enabled MetricAccess (no cardinality for absent tenants)",
+        "Test asserts proxy_tenant_collection_up flips correctly across stall then recover",
+        "Tests pass (go test ./...)",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Ship a fleet-wide PrometheusRule for persistent silent stall",
+      "description": "As an operator, I want a PrometheusRule shipped with the proxy that alerts when an onboarded tenant is silently stalled, so a stall is caught within minutes.",
+      "acceptanceCriteria": [
+        "A PrometheusRule manifest is authored for the ethos-core-prometheus-multi-tenant-proxy Helm chart",
+        "Primary alert expression uses the health metric: max by (namespace,name) (proxy_tenant_collection_up) == 0 for > 15m at severity warning/major",
+        "Corroborating fallback expression documented: up{metrics_path!=\"\"} == 0 persisting per tenant for > 15m (covers old images mid-rollout)",
+        "Alert has a runbook annotation referencing the rollout-restart workaround and ETHOS-115242",
+        "promtool test rules (or chart lint / helm template) passes for the new rule",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "Alert artifact authored here; the chart change itself lands in the ethos-core-prometheus-multi-tenant-proxy repo (out of scope for this repo's code)."
+    },
+    {
+      "id": "US-008",
+      "title": "End-to-end regression suite for runtime-add, churn, and self-heal",
+      "description": "As a maintainer, I want the regression suite to lock in all three failure modes so this cannot silently regress.",
+      "acceptanceCriteria": [
+        "Table-driven tests cover: (a) CR created after start is collected, (b) backend target set change recovers, (c) forced zero-collection triggers watchdog recreate then recovers, (d) persistent stall invokes the last-resort restart path (mocked exit)",
+        "No goroutine leaks across job create/stop (leak check or explicit StopCh assertions)",
+        "go test ./... is green in CI",
+        "Tests pass (go test ./...)",
+        "Typecheck passes (go build ./... and go vet ./... succeed)"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
