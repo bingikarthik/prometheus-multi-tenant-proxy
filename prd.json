@@ -112,8 +112,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 7,
-      "passes": false,
-      "notes": "Alert artifact authored here; the chart change itself lands in the ethos-core-prometheus-multi-tenant-proxy repo (out of scope for this repo's code)."
+      "passes": true,
+      "notes": "deploy/alerts/: prometheusrule.yaml (CRD), rules.yaml (promtool-loadable mirror, kept in-sync), prometheusrule_test.yaml. Primary alert TEEV2ProxyTenantCollectionStalled: max by(namespace,name)(proxy_tenant_collection_up)==0 for 15m, warning, runbook->rollout restart + ETHOS-115242. Fallback TEEV2ProxyTargetDown (up{metrics_path!=\"\"}==0). Secondary churn alerts on proxy_self_restart_total / proxy_tenant_stall_recreations_total. promtool check+test both SUCCESS. Chart lands in ethos-core-prometheus-multi-tenant-proxy repo."
     },
     {
       "id": "US-008",
