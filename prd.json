@@ -65,8 +65,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 4,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "evaluateSelfHeal(ctx,now) wired into reconcileLoop tick (reuses ticker + c.now). Stalled job -> stop+recreate with fresh targets; config.RecreateBackoff default 5m; job.lastRecreateAt/recreateCount carried across recreate; success clears throttle baseline (recreateCount kept lifetime). isJobStalled split into isJobStalledLocked core. 4 tests, -race clean. US-005 escalates via job.recreateCount in same func."
     },
     {
       "id": "US-005",
