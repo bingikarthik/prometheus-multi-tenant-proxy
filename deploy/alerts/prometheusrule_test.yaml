@@ -1,0 +1,39 @@
+# promtool unit test for the TEE-V2 proxy silent-stall alerts.
+# Run:   promtool test rules deploy/alerts/prometheusrule_test.yaml
+# (loads deploy/alerts/rules.yaml, the plain-rules mirror of prometheusrule.yaml)
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # tenant-a: silently stalled -- collection_up pinned at 0 for >15m.
+      - series: 'proxy_tenant_collection_up{namespace="tenant-a", name="ma"}'
+        values: '0x20'
+      # tenant-b: healthy -- collection_up pinned at 1 the whole window.
+      - series: 'proxy_tenant_collection_up{namespace="tenant-b", name="mb"}'
+        values: '1x20'
+
+    alert_rule_test:
+      # Before the 15m `for` window elapses the alert must be pending, not firing.
+      - eval_time: 10m
+        alertname: TEEV2ProxyTenantCollectionStalled
+        exp_alerts: []
+
+      # After 15m the stalled tenant fires; the healthy tenant is absent from
+      # exp_alerts, which asserts it does NOT fire.
+      - eval_time: 16m
+        alertname: TEEV2ProxyTenantCollectionStalled
+        exp_alerts:
+          - exp_labels:
+              namespace: tenant-a
+              name: ma
+              severity: warning
+              service: prometheus-multi-tenant-proxy
+              team: ethos-core
+            exp_annotations:
+              summary: "TEE-V2 proxy tenant collection silently stalled (tenant-a/ma)"
+              description: "Per-tenant remote-write collection for MetricAccess tenant-a/ma has reported proxy_tenant_collection_up=0 for 15m. The tenant is onboarded (the metric only exists for tenants with an enabled remote-write job) but no series are being collected or forwarded - a silent stall."
+              runbook: "Workaround: kubectl -n monitoring rollout restart deploy/prometheus-multi-tenant-proxy - see ETHOS-115242."
