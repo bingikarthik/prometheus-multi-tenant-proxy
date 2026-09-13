@@ -61,6 +61,10 @@ type Controller struct {
 // unset or non-positive.
 const defaultStallGracePeriod = 15 * time.Minute
 
+// defaultRecreateBackoff is used when RemoteWriteConfig.RecreateBackoff is unset
+// or non-positive.
+const defaultRecreateBackoff = 5 * time.Minute
+
 // RemoteWriteJob represents a remote write job for a tenant
 type RemoteWriteJob struct {
 	MetricAccess *v1alpha1.MetricAccess
@@ -89,6 +93,20 @@ type RemoteWriteJob struct {
 	// createdAt is the controller-clock time the job was created; used as the
 	// stall baseline for a job that has never succeeded.
 	createdAt time.Time
+
+	// Self-heal recreate throttle (US-004, ETHOS-115242). Guarded by
+	// Controller.mu.
+	//
+	// lastRecreateAt is the controller-clock time this job (across recreates)
+	// was last recreated by the watchdog; zero if never recreated. It is the
+	// baseline for the recreateBackoff rate limit and is carried forward onto the
+	// fresh job struct at recreate time. A successful collection clears it so a
+	// future stall is handled fresh.
+	lastRecreateAt time.Time
+	// recreateCount is a lifetime counter of how many times this logical job has
+	// been recreated by the watchdog. It is carried forward across recreates and
+	// is intentionally NOT reset on a successful collection.
+	recreateCount int
 }
 
 // NewController creates a new remote write controller
@@ -114,24 +132,41 @@ func (c *Controller) stallGracePeriod() time.Duration {
 	return defaultStallGracePeriod
 }
 
+// recreateBackoff returns the configured self-heal recreate backoff, falling
+// back to defaultRecreateBackoff when unset. Callers must not hardcode the
+// default.
+func (c *Controller) recreateBackoff() time.Duration {
+	if c.config.RecreateBackoff > 0 {
+		return c.config.RecreateBackoff
+	}
+	return defaultRecreateBackoff
+}
+
 // isJobStalled reports whether an enabled collection job has gone without a
 // successful collection for longer than the stall grace period. A job that has
-// never succeeded is judged against its creation time baseline. Detection only
-// (US-003); recovery is handled by later stories.
+// never succeeded is judged against its creation time baseline. Detection lives
+// in US-003; the recovery action lives in US-004 (see evaluateSelfHeal).
 func (c *Controller) isJobStalled(job *RemoteWriteJob, now time.Time) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.isJobStalledLocked(job, now)
+}
+
+// isJobStalledLocked is the lock-free core of isJobStalled. Callers must hold
+// c.mu (read or write). Extracted so the self-heal watchdog can evaluate stall
+// state while already holding c.mu.Lock without re-entering the RWMutex.
+func (c *Controller) isJobStalledLocked(job *RemoteWriteJob, now time.Time) bool {
 	if job == nil || job.MetricAccess == nil ||
 		job.MetricAccess.Spec.RemoteWrite == nil ||
 		!job.MetricAccess.Spec.RemoteWrite.Enabled {
 		return false
 	}
 
-	c.mu.RLock()
 	baseline := job.lastSuccessfulCollectionTime
 	if baseline.IsZero() {
 		// Never succeeded: fall back to the job's creation time.
 		baseline = job.createdAt
 	}
-	c.mu.RUnlock()
 
 	if baseline.IsZero() {
 		// No baseline to judge against; avoid a false positive.
@@ -185,6 +220,10 @@ func (c *Controller) reconcileLoop(ctx context.Context) {
 			if err := c.reconcileRemoteWriteJobs(ctx); err != nil {
 				logrus.Errorf("Failed to reconcile remote write jobs: %v", err)
 			}
+			// US-004 self-heal: after reconciling desired state, sweep active
+			// jobs and recreate any that have stalled. Reuses this ticker rather
+			// than spawning a separate goroutine.
+			c.evaluateSelfHeal(ctx, c.now())
 		}
 	}
 }
@@ -326,9 +365,79 @@ func (c *Controller) stopRemoteWriteJobLocked(key string, job *RemoteWriteJob) {
 func (c *Controller) stopAllJobs() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	for key, job := range c.jobs {
 		c.stopRemoteWriteJobLocked(key, job)
+	}
+}
+
+// evaluateSelfHeal is the first self-heal action (US-004, ETHOS-115242). It is
+// the watchdog step invoked from the reconcile tick: for each stalled job it
+// stops the in-process collection job and recreates it with fresh target
+// resolution, before any pod restart (which is US-005). Recreation is
+// rate-limited per job by recreateBackoff, and throttle bookkeeping
+// (lastRecreateAt/recreateCount) is carried forward onto the fresh job struct.
+//
+// It holds c.mu for the whole sweep, consistent with reconcileRemoteWriteJobs,
+// and uses isJobStalledLocked to avoid re-entering the RWMutex.
+func (c *Controller) evaluateSelfHeal(ctx context.Context, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Collect stalled keys first so we do not recreate while ranging the map we
+	// are about to mutate (stop deletes, create re-adds the same key).
+	var stalledKeys []string
+	for key, job := range c.jobs {
+		if c.isJobStalledLocked(job, now) {
+			stalledKeys = append(stalledKeys, key)
+		}
+	}
+
+	for _, key := range stalledKeys {
+		job, ok := c.jobs[key]
+		if !ok {
+			continue
+		}
+
+		// Rate limit: recreate a given job at most once per recreateBackoff.
+		if !job.lastRecreateAt.IsZero() && now.Sub(job.lastRecreateAt) < c.recreateBackoff() {
+			continue
+		}
+
+		// Stall duration for logging: measured from the same baseline used to
+		// classify the stall (last success, else creation time).
+		baseline := job.lastSuccessfulCollectionTime
+		if baseline.IsZero() {
+			baseline = job.createdAt
+		}
+		stallDuration := now.Sub(baseline)
+
+		// Carry throttle bookkeeping forward across the stop/recreate: the new
+		// job is a fresh struct, so capture the counters before stopping.
+		metricAccess := job.MetricAccess
+		nextRecreateCount := job.recreateCount + 1
+
+		c.stopRemoteWriteJobLocked(key, job)
+		if err := c.createRemoteWriteJobLocked(ctx, metricAccess); err != nil {
+			logrus.WithFields(logrus.Fields{
+				"tenant_key":     key,
+				"stall_duration": stallDuration.String(),
+				"recreate_count": nextRecreateCount,
+			}).Errorf("US-004 self-heal: failed to recreate stalled collection job: %v", err)
+			continue
+		}
+
+		// Set throttle state on the freshly created job struct.
+		newJob := c.jobs[key]
+		newJob.lastRecreateAt = now
+		newJob.recreateCount = nextRecreateCount
+
+		logrus.WithFields(logrus.Fields{
+			"tenant_key":     key,
+			"stall_duration": stallDuration.String(),
+			"recreate_count": newJob.recreateCount,
+			"attempt":        newJob.recreateCount,
+		}).Warn("US-004 self-heal: recreated stalled collection job")
 	}
 }
 
@@ -592,6 +701,10 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 		job.lastSuccessfulCollectionTime = c.now()
 		job.lastCollectedSeriesCount = len(allMetrics)
 		job.consecutiveEmptyCollections = 0
+		// US-004: clear the self-heal recreate throttle baseline so a future
+		// stall is handled fresh. recreateCount is a lifetime counter and is
+		// intentionally left intact.
+		job.lastRecreateAt = time.Time{}
 		c.mu.Unlock()
 	} else {
 		// Healthy targets were queried but returned zero series: a silent empty

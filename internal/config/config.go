@@ -114,6 +114,13 @@ type RemoteWriteConfig struct {
 	// before it is classified as stalled. A job that has never succeeded is
 	// judged against its creation time. Unset or zero values default to 15m.
 	StallGracePeriod time.Duration `yaml:"stall_grace_period"`
+
+	// RecreateBackoff is the minimum interval between successive in-process
+	// recreations of the same stalled collection job by the self-heal watchdog
+	// (US-004). A given job is recreated at most once per this window, preventing
+	// a persistently unhealthy target from causing tight recreate churn. Unset or
+	// zero values default to 5m.
+	RecreateBackoff time.Duration `yaml:"recreate_backoff"`
 }
 
 // AuthConfig holds authentication settings (optional)
@@ -235,6 +242,10 @@ func setDefaults(config *Config) error {
 
 	if config.RemoteWrite.StallGracePeriod <= 0 {
 		config.RemoteWrite.StallGracePeriod = 15 * time.Minute
+	}
+
+	if config.RemoteWrite.RecreateBackoff <= 0 {
+		config.RemoteWrite.RecreateBackoff = 5 * time.Minute
 	}
 	
 	// Auth defaults
