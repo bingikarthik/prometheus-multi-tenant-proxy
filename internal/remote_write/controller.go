@@ -50,7 +50,16 @@ type Controller struct {
 	// Control channels
 	stopCh chan struct{}
 	doneCh chan struct{}
+
+	// now is an injectable clock seam. It defaults to time.Now in NewController
+	// and is overridden in tests to make stall detection deterministic without
+	// real sleeps.
+	now func() time.Time
 }
+
+// defaultStallGracePeriod is used when RemoteWriteConfig.StallGracePeriod is
+// unset or non-positive.
+const defaultStallGracePeriod = 15 * time.Minute
 
 // RemoteWriteJob represents a remote write job for a tenant
 type RemoteWriteJob struct {
@@ -63,6 +72,23 @@ type RemoteWriteJob struct {
 	MetricsCount  int64
 	SuccessCount  int64
 	FailureCount  int64
+
+	// Collection health tracking (US-003, ETHOS-115242). A collection SUCCESS is
+	// (>=1 series stored) AND (remote-write send returned no error). These fields
+	// are guarded by Controller.mu.
+	//
+	// lastSuccessfulCollectionTime is the controller-clock time of the last
+	// SUCCESS; zero if the job has never succeeded.
+	lastSuccessfulCollectionTime time.Time
+	// lastCollectedSeriesCount is the series count of the last SUCCESS.
+	lastCollectedSeriesCount int
+	// consecutiveEmptyCollections counts consecutive non-successful cycles
+	// (zero healthy targets, zero series after collection, or a send error).
+	// Reset to 0 on a SUCCESS.
+	consecutiveEmptyCollections int
+	// createdAt is the controller-clock time the job was created; used as the
+	// stall baseline for a job that has never succeeded.
+	createdAt time.Time
 }
 
 // NewController creates a new remote write controller
@@ -75,7 +101,44 @@ func NewController(client client.Client, cfg config.RemoteWriteConfig, serviceDi
 		collectedMetrics:  make(map[string][]Metric),
 		stopCh:           make(chan struct{}),
 		doneCh:           make(chan struct{}),
+		now:              time.Now,
 	}
+}
+
+// stallGracePeriod returns the configured stall grace period, falling back to
+// defaultStallGracePeriod when unset. Callers must not hardcode the default.
+func (c *Controller) stallGracePeriod() time.Duration {
+	if c.config.StallGracePeriod > 0 {
+		return c.config.StallGracePeriod
+	}
+	return defaultStallGracePeriod
+}
+
+// isJobStalled reports whether an enabled collection job has gone without a
+// successful collection for longer than the stall grace period. A job that has
+// never succeeded is judged against its creation time baseline. Detection only
+// (US-003); recovery is handled by later stories.
+func (c *Controller) isJobStalled(job *RemoteWriteJob, now time.Time) bool {
+	if job == nil || job.MetricAccess == nil ||
+		job.MetricAccess.Spec.RemoteWrite == nil ||
+		!job.MetricAccess.Spec.RemoteWrite.Enabled {
+		return false
+	}
+
+	c.mu.RLock()
+	baseline := job.lastSuccessfulCollectionTime
+	if baseline.IsZero() {
+		// Never succeeded: fall back to the job's creation time.
+		baseline = job.createdAt
+	}
+	c.mu.RUnlock()
+
+	if baseline.IsZero() {
+		// No baseline to judge against; avoid a false positive.
+		return false
+	}
+
+	return now.Sub(baseline) > c.stallGracePeriod()
 }
 
 // Start begins the remote write controller
@@ -234,6 +297,8 @@ func (c *Controller) createRemoteWriteJobLocked(ctx context.Context, metricAcces
 		MetricAccess: metricAccess.DeepCopy(),
 		// No static targets - get them fresh each time
 		StopCh:       make(chan struct{}),
+		// Stall baseline for a job that has never had a successful collection.
+		createdAt: c.now(),
 	}
 	
 	c.jobs[key] = job
@@ -447,10 +512,16 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 			"name":      job.MetricAccess.Name,
 		}).Warn("DIAGNOSTIC: No healthy targets available for metric collection")
 		
-		// Store empty metrics
+		// Store empty metrics and record a non-successful (empty) collection
+		// cycle. This is NOT a success: no series were stored, so the stall
+		// counter advances and lastSuccessfulCollectionTime is left untouched.
+		// LastError/FailureCount are deliberately unchanged here to preserve the
+		// existing zero-target semantics (this is a silent empty cycle, not a
+		// collection error) — stall detection lives on the new fields.
 		key := fmt.Sprintf("%s/%s", job.MetricAccess.Namespace, job.MetricAccess.Name)
 		c.mu.Lock()
 		c.collectedMetrics[key] = []Metric{}
+		job.consecutiveEmptyCollections++
 		c.mu.Unlock()
 		
 		logrus.WithFields(logrus.Fields{
@@ -507,10 +578,27 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 			logrus.WithError(err).Error("Failed to send metrics")
 			job.LastError = err
 			job.FailureCount++
+			// A send failure is not a successful collection: record an empty
+			// cycle so a persistently failing send counts toward a stall.
+			c.mu.Lock()
+			job.consecutiveEmptyCollections++
+			c.mu.Unlock()
 			return
 		}
 		job.SuccessCount++
 		job.MetricsCount += int64(len(allMetrics))
+		// SUCCESS: >=1 series stored AND remote-write send returned no error.
+		c.mu.Lock()
+		job.lastSuccessfulCollectionTime = c.now()
+		job.lastCollectedSeriesCount = len(allMetrics)
+		job.consecutiveEmptyCollections = 0
+		c.mu.Unlock()
+	} else {
+		// Healthy targets were queried but returned zero series: a silent empty
+		// cycle. Advance the stall counter without recording an error.
+		c.mu.Lock()
+		job.consecutiveEmptyCollections++
+		c.mu.Unlock()
 	}
 
 	job.LastRun = time.Now()

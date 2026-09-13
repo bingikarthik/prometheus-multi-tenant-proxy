@@ -108,6 +108,12 @@ type RemoteWriteConfig struct {
 	// MetricAccess CR. Batching is always active; the only tunable is the
 	// chunk size. Unset or zero values default to 5000.
 	BatchSize int `yaml:"batch_size"`
+
+	// StallGracePeriod is how long a per-tenant collection job may go without a
+	// successful collection (>=1 series stored AND remote-write send succeeded)
+	// before it is classified as stalled. A job that has never succeeded is
+	// judged against its creation time. Unset or zero values default to 15m.
+	StallGracePeriod time.Duration `yaml:"stall_grace_period"`
 }
 
 // AuthConfig holds authentication settings (optional)
@@ -225,6 +231,10 @@ func setDefaults(config *Config) error {
 
 	if config.RemoteWrite.BatchSize <= 0 {
 		config.RemoteWrite.BatchSize = 5000
+	}
+
+	if config.RemoteWrite.StallGracePeriod <= 0 {
+		config.RemoteWrite.StallGracePeriod = 15 * time.Minute
 	}
 	
 	// Auth defaults
