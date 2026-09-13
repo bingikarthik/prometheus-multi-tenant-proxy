@@ -81,8 +81,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 5,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Leader-only, throttled pod-restart via injectable Controller.exit seam. Config: PodRestartGracePeriod 45m, PodRestartCooldown 30m, SelfHealPodRestart flag default true (--self-heal-pod-restart). Fixed reachability: persistent job.stalledSince baseline carried across recreate, cleared only on genuine success -> escalation fires after >45m continuous stall (regression test fires t0+64m). selfRestartTotal counter feeds US-006. -race clean."
     },
     {
       "id": "US-006",
