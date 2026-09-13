@@ -48,8 +48,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 3,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added RemoteWriteJob health fields (lastSuccessfulCollectionTime, lastCollectedSeriesCount, consecutiveEmptyCollections, createdAt), clock seam Controller.now, config.StallGracePeriod (default 15m), and isJobStalled(). collectMetrics now only counts >=1 series + send-ok as success; empty/zero/send-error advance empty-cycle counter without faking success. US-001/002 tests still green; -race clean."
     },
     {
       "id": "US-004",
