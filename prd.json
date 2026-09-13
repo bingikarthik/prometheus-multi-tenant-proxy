@@ -127,8 +127,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 8,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "controller_e2e_test.go: (a) runtime-add collected, (b) churn recovers, (c) zero-collection->watchdog recreate->recover, (d) persistent stall->last-resort restart once. Goroutine-leak: structural StopCh-closed + NumGoroutine delta (no goleak dep, go.mod untouched). Found+fixed a real pre-existing data race: updateJobStatus wrote MetricAccess.Status without c.mu, racing DeepCopy in recreate; now serialized under c.mu. -race stable x8/count3x4."
     }
   ]
 }
