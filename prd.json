@@ -16,8 +16,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 1,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "HEAD fixes runtime-add (reconcile poll, ~<=30s) and churn (dynamic GetTargets). Residual wedge confirmed: healthyTargets==0 branch stores 0 series, sets no error, job stays Active -> drives US-003/004/005. Harness: internal/remote_write/controller_selfheal_test.go; findings: tasks/us-001-findings.md."
     },
     {
       "id": "US-002",
