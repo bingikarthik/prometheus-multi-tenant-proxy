@@ -32,8 +32,8 @@
         "Typecheck passes (go build ./... and go vet ./... succeed)"
       ],
       "priority": 2,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "HEAD reconcile logic already correct (no prod change). Added 5 regression tests in controller_reconcile_test.go covering create/enable-after-start, metric-set-change restart, delete, disable; RED-proof mutation confirmed they catch the shipped-image bug class. -race clean."
     },
     {
       "id": "US-003",
