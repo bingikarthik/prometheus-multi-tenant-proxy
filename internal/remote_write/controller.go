@@ -124,6 +124,12 @@ type RemoteWriteJob struct {
 	// (zero healthy targets, zero series after collection, or a send error).
 	// Reset to 0 on a SUCCESS.
 	consecutiveEmptyCollections int
+	// lastCollectionSucceeded records the outcome of the MOST RECENT collection
+	// cycle: true iff that cycle stored >=1 series AND the remote-write send
+	// returned no error. It is the source for the US-006
+	// proxy_tenant_collection_up gauge and is set on every cycle branch of
+	// collectMetrics (empty/zero/send-error -> false, success -> true).
+	lastCollectionSucceeded bool
 	// createdAt is the controller-clock time the job was created; used as the
 	// stall baseline for a job that has never succeeded.
 	createdAt time.Time
@@ -795,6 +801,7 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 		c.mu.Lock()
 		c.collectedMetrics[key] = []Metric{}
 		job.consecutiveEmptyCollections++
+		job.lastCollectionSucceeded = false
 		c.mu.Unlock()
 		
 		logrus.WithFields(logrus.Fields{
@@ -855,6 +862,7 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 			// cycle so a persistently failing send counts toward a stall.
 			c.mu.Lock()
 			job.consecutiveEmptyCollections++
+			job.lastCollectionSucceeded = false
 			c.mu.Unlock()
 			return
 		}
@@ -865,6 +873,7 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 		job.lastSuccessfulCollectionTime = c.now()
 		job.lastCollectedSeriesCount = len(allMetrics)
 		job.consecutiveEmptyCollections = 0
+		job.lastCollectionSucceeded = true
 		// US-004: clear the self-heal recreate throttle baseline so a future
 		// stall is handled fresh. recreateCount is a lifetime counter and is
 		// intentionally left intact.
@@ -878,6 +887,7 @@ func (c *Controller) collectMetrics(job *RemoteWriteJob) {
 		// cycle. Advance the stall counter without recording an error.
 		c.mu.Lock()
 		job.consecutiveEmptyCollections++
+		job.lastCollectionSucceeded = false
 		c.mu.Unlock()
 	}
 

@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus-multi-tenant-proxy/internal/proxy"
 	remote_write "github.com/prometheus-multi-tenant-proxy/internal/remote_write"
 	"github.com/prometheus-multi-tenant-proxy/internal/tenant"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -107,7 +108,13 @@ func main() {
 	// Always create the controller even if remote write is disabled
 	// This ensures the /collected-metrics endpoint works even without MetricAccess resources
 		remoteWriteController = remote_write.NewController(crClient, cfg.RemoteWrite, serviceDiscovery)
-	
+
+	// US-006 (ETHOS-115242): register the per-tenant collection-health collector
+	// on the default registry so the existing /metrics endpoint (promhttp.Handler)
+	// serves proxy_tenant_collection_up and friends. The collector reads live job
+	// state each scrape, so it costs nothing until scraped and carries no state.
+	prometheus.MustRegister(remote_write.NewHealthCollector(remoteWriteController))
+
 	// Start remote write controller only if enabled in config
 	enableRemoteWrite := cfg.RemoteWrite.Enabled
 
